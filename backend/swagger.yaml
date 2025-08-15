@@ -1,0 +1,136 @@
+openapi: 3.0.0
+info:
+  title: Codebase RAG API
+  version: 1.0.0
+  description: API for uploading code and querying using Retrieval-Augmented Generation
+servers:
+  - url: http://localhost:3001
+
+paths:
+  /api/upload:
+    post:
+      summary: Upload GitHub repo or ZIP file of codebase
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                type:
+                  type: string
+                  enum: [github, zip]
+                repo_url:
+                  type: string
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: Upload accepted
+
+  /api/query:
+    post:
+      summary: Ask a question about the codebase
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                question:
+                  type: string
+                repoId:
+                  type: string
+      responses:
+        "200":
+          description: Answer returned
+
+  /api/health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: Server is up
+
+  /api/repos/{repoId}/status:
+    get:
+      summary: Get indexing status of a specific repo
+      parameters:
+        - name: repoId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Indexing status returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+
+  /api/repos/{repoId}/files:
+    get:
+      summary: Get list of files in the uploaded repo
+      parameters:
+        - name: repoId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of file paths
+
+  /api/repos/{repoId}/file:
+    get:
+      summary: Get content of a file
+      parameters:
+        - name: repoId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: File content
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path:
+                    type: string
+                  content:
+                    type: string
+
+  /api/repos/{repoId}/queries:
+    get:
+      summary: Get list of user questions and LLM answers for this repo
+      parameters:
+        - name: repoId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Query history
+
+components:
+  schemas:
+    Status:
+      type: object
+      properties:
+        status:
+          type: string
+          description: Indexing status

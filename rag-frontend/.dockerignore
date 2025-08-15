@@ -1,0 +1,9 @@
+node_modules
+.pnpm
+**/node_modules
+**/.pnpm
+dist
+build
+.git
+Dockerfile
+docker-compose.yml

@@ -1,0 +1,36 @@
+FROM python:3.11-slim
+
+# set working directory
+WORKDIR /app
+
+# environment tweaks
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DEFAULT_TIMEOUT=100 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# install only runtime OS deps (including git for GitPython)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ca-certificates \
+    wget \
+    git && \
+    rm -rf /var/lib/apt/lists/*
+
+# copy requirements early for layer caching
+COPY requirements.txt .
+
+# install python deps with pip cache (requires BuildKit)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip setuptools wheel && \
+    PIP_CACHE_DIR=/root/.cache/pip pip install -r requirements.txt
+
+# copy application code
+COPY . .
+
+EXPOSE 3001
+
+# entrypoint
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

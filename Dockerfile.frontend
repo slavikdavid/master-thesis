@@ -1,0 +1,22 @@
+FROM node:24-alpine
+
+# setup working directory
+WORKDIR /app
+
+# enable and prepare pnpm
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
+# copy only lockfiles and manifest first (caching)
+COPY package.json pnpm-lock.yaml ./
+
+# install dependencies
+RUN pnpm install --frozen-lockfile
+
+# now copy the full app
+COPY . .
+
+# expose Vite dev server port
+EXPOSE 5173
+
+# start the dev server with network binding
+CMD ["pnpm", "dev", "--host", "0.0.0.0"]

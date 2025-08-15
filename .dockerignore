@@ -1,0 +1,26 @@
+# Node stuff
+**/node_modules
+**/.pnpm
+dist/
+build/
+
+# Python cache / env
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+*.cache/
+.env
+
+# Large runtime data you don't want in image
+**/data/
+**/uploads/
+
+# Git metadata
+.git/
+
+# OS/tooling and logs
+.DS_Store
+*.log
