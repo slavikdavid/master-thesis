@@ -3,7 +3,7 @@ from pydantic import Field, AnyHttpUrl
 
 class Settings(BaseSettings):
     # Database
-    DATABASE_DSN: str = Field(..., env="DATABASE_URL")
+    DATABASE_DSN: str = Field(..., env="DATABASE_DSN")
 
     # JWT / Auth
     JWT_SECRET: str = Field(..., env="JWT_SECRET")
