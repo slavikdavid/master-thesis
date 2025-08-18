@@ -10,7 +10,7 @@ while true; do
 import os, sys, asyncio, asyncpg
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join("/app", ".env"))
-dsn = os.getenv("DATABASE_URL")
+dsn = os.getenv("DATABASE_DSN")
 try:
     asyncio.run(asyncpg.connect(dsn))
     print("DB reachable")
