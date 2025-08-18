@@ -1,93 +1,148 @@
 # app/utils.py
 import os
-import json
-import glob
 from pathlib import Path
+from typing import List, Dict, Any, Optional
 
 from haystack import Document
+from haystack.utils import Secret
 from haystack_integrations.document_stores.pgvector import PgvectorDocumentStore
-from haystack.components.embedders import SentenceTransformersDocumentEmbedder
+from haystack_integrations.components.embedders.voyage_embedders import (
+    VoyageDocumentEmbedder,
+    VoyageTextEmbedder,
+)
 
 from app.chunking import chunk_code
+from app.services.file_utils import list_files
 
-# where repos get unpacked
-UPLOADS = Path(__file__).resolve().parents[1] / "uploads"
+# dir where repos get unpacked
+UPLOADS = Path(os.getenv("UPLOAD_DIR", "uploads")).resolve()
 
 # name of the shared embeddings table
-EMBEDDINGS_TABLE = "embeddings"
+EMBEDDINGS_TABLE = os.getenv("EMBEDDINGS_INDEX", "embeddings")
 
-# initialize or get the shared document store
-def get_document_store():
+# ---- model & dim (voyage-code-2 dim is 1536) ----
+VOYAGE_MODEL = os.getenv("VOYAGE_MODEL", "voyage-code-2")
+DEFAULT_EMBED_DIM = int(os.getenv("EMBEDDING_DIMENSION", "1536"))
+
+
+def get_document_store(
+    recreate: bool = False,
+    embedding_dimension: Optional[int] = None,
+) -> PgvectorDocumentStore:
+    """
+    Return a PgvectorDocumentStore consistent with the one used in indexing.py.
+    NOTE: indexing.py lazily creates the table when it knows the model's true dim.
+    Here, we fall back to DEFAULT_EMBED_DIM if not provided.
+    """
+    dim = embedding_dimension or DEFAULT_EMBED_DIM
     return PgvectorDocumentStore(
+        connection_string=Secret.from_env_var("DATABASE_DSN"),
         table_name=EMBEDDINGS_TABLE,
-        embedding_dimension=384,            # matches all-MiniLM-L6-v2
-        vector_function="cosine_similarity",
-        recreate_table=False,               # keep existing data/schema
+        embedding_dimension=dim,
+        create_extension=True,
+        recreate_table=recreate,
         search_strategy="hnsw",
+        hnsw_recreate_index_if_exists=False,
+        hnsw_index_creation_kwargs={"M": 16, "ef_construction": 200},
+        hnsw_index_name="haystack_hnsw_index",
+        hnsw_ef_search=50,
     )
 
 
-def load_code_chunks(repo_id: str):
+def _skip_hidden(rel_path: str) -> bool:
     """
-    Load and chunk code files for a given repo using tree-sitter based chunking.
+    Return True if any path segment starts with '.' (e.g. '.git', '.env', '.dir/file').
     """
-    repo_path = UPLOADS / repo_id
-    all_files = glob.glob(str(repo_path / "**/*.*"), recursive=True)
+    parts = rel_path.replace("\\", "/").split("/")
+    return any(p.startswith(".") for p in parts if p)  # skip hidden files/dirs anywhere in the path
 
-    docs = []
-    for file in all_files:
-        # only process supported code files
+
+def load_code_chunks(repo_id: str) -> List[Document]:
+    """
+    Load and chunk code/text files for a given repo_id.
+    Skips any file whose path contains a hidden segment (starts with '.').
+    """
+    repo_path = (UPLOADS / repo_id).resolve()
+    if not repo_path.is_dir():
+        return []
+
+    docs: List[Document] = []
+    for rel_path in list_files(repo_id):
+        if _skip_hidden(rel_path):
+            continue
+
+        abs_path = (repo_path / rel_path).resolve()
+        # ensure containment
         try:
-            content = Path(file).read_text(encoding="utf-8")
+            if not str(abs_path).startswith(str(repo_path)) or not abs_path.is_file():
+                continue
         except Exception:
             continue
 
-        # chunk_code handles language support, fallback, and overlap
-        for idx, chunk in enumerate(chunk_code(file, content)):
+        # read text (skip binaries)
+        try:
+            text = abs_path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+
+        # chunk_code returns dicts: {content, start_line, end_line}
+        for idx, ch in enumerate(chunk_code(rel_path, text)):
+            content = (ch.get("content") or "").strip()
+            if not content:
+                continue
             docs.append(
                 Document(
-                    content=chunk,
+                    content=content,
                     meta={
                         "repo_id": repo_id,
-                        "filename": os.path.relpath(file, repo_path),
+                        "filename": rel_path,
                         "chunk_index": idx,
+                        "start_line": ch.get("start_line"),
+                        "end_line": ch.get("end_line"),
                     },
                 )
             )
     return docs
 
 
-def index_repo(repo_id: str):
-    # 1) load chunks
-    docs = load_code_chunks(repo_id)
+def index_repo(repo_id: str, *, batch_size: int = 16, max_chars: int = 5000, overlap: int = 200) -> Dict[str, Any]:
+    """
+    Thin wrapper to kick off the real async/threaded indexing pipeline.
+    Returns immediately; progress is reported via the WebSocket broker.
+    """
+    repo_dir = (UPLOADS / repo_id).resolve()
+    if not repo_dir.is_dir():
+        return {"status": "error", "detail": "Repository not found"}
 
-    # 2) connect to the shared Postgres+pgvector store
-    document_store = get_document_store()
+    from app.services.indexing import index_repo as _index_repo  # local import to avoid cycles
+    _index_repo(str(repo_dir), repo_id, batch_size=batch_size, max_chars=max_chars, overlap=overlap)
+    return {"status": "started", "repo_id": repo_id}
 
-    # 3) delete any existing docs for repo
-    document_store.delete_documents(
-        index=EMBEDDINGS_TABLE,
-        filters={"repo_id": repo_id}
+
+def get_query_embedder() -> VoyageTextEmbedder:
+    """
+    Returns a VoyageTextEmbedder configured for query embeddings.
+    Usage:
+        q_embedder = get_query_embedder()
+        q_embedder.run({"text": "find init functions in auth module"})
+    """
+    return VoyageTextEmbedder(
+        model=VOYAGE_MODEL,
+        input_type="query",
     )
 
-    # 4) write new docs
-    document_store.write_documents(docs, index=EMBEDDINGS_TABLE)
 
-    # 5) embed all un-embedded docs (or re-embed)
-    embedder = SentenceTransformersDocumentEmbedder(
-        model="sentence-transformers/all-MiniLM-L6-v2"
-    )
-    embedder.warm_up()
-    document_store.update_embeddings(
-        embedder,
-        batch_size=32,
-        index=EMBEDDINGS_TABLE
-    )
-
-    # 6) persist status for WS endpoints
-    data_path = Path(__file__).resolve().parents[1] / "data" / "repos" / repo_id
-    data_path.mkdir(parents=True, exist_ok=True)
-    with open(data_path / "status.json", "w") as f:
-        json.dump({"status": "indexed", "chunks": len(docs)}, f)
-
-    return {"status": "indexed", "chunks": len(docs)}
+# one-off utility if needed to backfill embeddings for existing docs
+def backfill_embeddings(batch_size: int = 32) -> int:
+    """
+    Embed any documents in the store missing embeddings.
+    Returns number of docs processed. Use sparingly; live flow already embeds on write.
+    """
+    store = get_document_store()
+    embedder = VoyageDocumentEmbedder(model=VOYAGE_MODEL, input_type="document")
+    try:
+        embedder.warm_up()
+    except Exception:
+        pass
+    store.update_embeddings(embedder, batch_size=batch_size, index=EMBEDDINGS_TABLE)
+    return 0
