@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_DSN")
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 APPLIED_TABLE = "schema_migrations"
 
