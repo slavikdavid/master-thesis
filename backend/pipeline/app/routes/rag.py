@@ -26,7 +26,7 @@ class RetrieveResponse(BaseModel):
 async def retrieve(req: RetrieveRequest):
     # 1) embed the incoming query
     embedder = SentenceTransformersTextEmbedder(
-        model="sentence-transformers/all-MiniLM-L6-v2"
+        model="nomic-ai/nomic-embed-code"
     )
     embedder.warm_up()
     out = embedder.run({"text": req.query})
