@@ -2,9 +2,10 @@
 
 import uuid
 from fastapi import APIRouter, BackgroundTasks, UploadFile, HTTPException, Form, File
+
 from app.services.upload import handle_github_clone, handle_zip_upload
 
-router = APIRouter()
+router = APIRouter(tags=["upload"])  # keep prefixing at include_router level (e.g., "/api")
 
 @router.post("/upload", status_code=202)
 async def upload_repo(
@@ -14,22 +15,29 @@ async def upload_repo(
     file: UploadFile | None = File(None, description="ZIP file, when type=zip"),
 ):
     """
-    Start a repo upload (GitHub clone or ZIP extract) in the background,
-    returning a repoId with HTTP 202 on success.
+    Start a repo ingest in the background:
+      - type=github → clone via Git and stream progress
+      - type=zip    → read uploaded .zip and stream progress
+
+    Always returns 202 + {repoId}. Background tasks broadcast progress over WS.
     """
+    kind = (type or "").strip().lower()
+    if kind not in {"github", "zip"}:
+        raise HTTPException(status_code=400, detail="Unknown upload type (use 'github' or 'zip').")
+
     repo_id = uuid.uuid4().hex
 
-    if type == "github":
-        if not repo_url:
+    if kind == "github":
+        ru = (repo_url or "").strip()
+        if not ru:
             raise HTTPException(status_code=400, detail="Missing repo_url for GitHub upload")
-        background_tasks.add_task(handle_github_clone, repo_url, repo_id)
+        # background task will broadcast progress + handle errors itself
+        background_tasks.add_task(handle_github_clone, ru, repo_id)
 
-    elif type == "zip":
-        if not file:
+    else:  # kind == "zip"
+        if file is None:
             raise HTTPException(status_code=400, detail="Missing file for ZIP upload")
+        # background task will stream the upload to disk, extract, index, and broadcast progress
         background_tasks.add_task(handle_zip_upload, file, repo_id)
-
-    else:
-        raise HTTPException(status_code=400, detail="Unknown upload type")
 
     return {"repoId": repo_id}

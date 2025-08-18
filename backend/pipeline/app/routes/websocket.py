@@ -1,7 +1,8 @@
 # app/routes/websocket.py
 
-from typing import Annotated, Optional
+from typing import Optional, Annotated
 import logging
+import asyncio
 
 from fastapi import (
     APIRouter,
@@ -16,7 +17,7 @@ import jwt
 from jwt import PyJWTError
 
 from app.config import JWT_SECRET, JWT_ALGORITHM
-from app.services.ws import tail_status, stream_progress
+from app.services.ws import stream_repo, set_main_loop
 
 router = APIRouter(prefix="/ws", tags=["websocket"])
 logger = logging.getLogger(__name__)
@@ -26,10 +27,6 @@ logger = logging.getLogger(__name__)
 async def get_token_payload(
     token: Annotated[str, Query(..., description="JWT token for auth")],
 ) -> dict:
-    """
-    Reads `?token=...` and verifies it with PyJWT.
-    Raises WebSocketException(1008) on failure.
-    """
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except PyJWTError:
@@ -38,8 +35,7 @@ async def get_token_payload(
 
 
 def _resolve_repo_id(repo_id: Optional[str], repoId: Optional[str]) -> str:
-    rid = (repo_id or repoId or "").strip()
-    return rid
+    return (repo_id or repoId or "").strip()
 
 
 @router.websocket("/status")
@@ -50,10 +46,13 @@ async def status_ws(
     repoId_q: Optional[str] = Query(None, alias="repoId"),
 ):
     """
-    Streams indexing status updates.
-    Usage:  ws://host/ws/status?token=...&repo_id=...  (or &repoId=...)
+    Streams a snapshot/keepalive + live progress updates for a repo.
     """
     await websocket.accept()
+    try:
+        set_main_loop(asyncio.get_running_loop())
+    except Exception:
+        pass
 
     repo_id = _resolve_repo_id(repo_id_q, repoId_q)
     if not repo_id:
@@ -61,13 +60,11 @@ async def status_ws(
         return
 
     try:
-        await tail_status(websocket, repo_id, interval=10.0)
+        await stream_repo(websocket, repo_id)
     except WebSocketDisconnect:
-        # normal close (tab change, refresh, etc.)
         pass
     except Exception:
         logger.exception("status_ws error")
-    finally:
         try:
             await websocket.close()
         except Exception:
@@ -82,10 +79,13 @@ async def progress_ws(
     repoId_q: Optional[str] = Query(None, alias="repoId"),
 ):
     """
-    Streams upload/indexing progress.
-    Usage:  ws://host/ws/progress?token=...&repo_id=...  (or &repoId=...)
+    Back-compat alias of /ws/status.
     """
     await websocket.accept()
+    try:
+        set_main_loop(asyncio.get_running_loop())
+    except Exception:
+        pass
 
     repo_id = _resolve_repo_id(repo_id_q, repoId_q)
     if not repo_id:
@@ -93,13 +93,11 @@ async def progress_ws(
         return
 
     try:
-        await stream_progress(websocket, repo_id, interval=1.0)
+        await stream_repo(websocket, repo_id)
     except WebSocketDisconnect:
-        # normal close
         pass
     except Exception:
         logger.exception("progress_ws error")
-    finally:
         try:
             await websocket.close()
         except Exception:

@@ -1,29 +1,42 @@
 # app/services/ws.py
 
 import os
-import json
 import asyncio
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from fastapi import WebSocket
 from fastapi.websockets import WebSocketDisconnect
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 
-# this module provides ONLY websocket utility functions.
-# websocket routes are defined in app/routes/websocket.py.
-
-# base folder where each repo keeps its status.json
 BASE = Path(os.getenv("DATA_DIR", "data/repos"))
 
-# in-memory watchers: repo_id -> list[WebSocket]
+# repo_id -> list[WebSocket] currently watching that repo
 _watchers: Dict[str, List[WebSocket]] = {}
 
+# reference to the server's main asyncio loop (for thread-safe broadcasts)
+_server_loop: Optional[asyncio.AbstractEventLoop] = None
+
 
 # ---------------------------
-# watcher management
+# loop + watcher management
 # ---------------------------
+def set_main_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Record the main server loop so background threads can schedule coroutines."""
+    global _server_loop
+    _server_loop = loop
+
+
 def register_watcher(repo_id: str, ws: WebSocket) -> None:
+    """Attach a websocket to a repo topic and capture the running loop once."""
+    global _server_loop
+    try:
+        loop = asyncio.get_running_loop()
+        if loop and loop.is_running():
+            _server_loop = loop
+    except RuntimeError:
+        # no running loop (called from a worker thread) — ignore
+        pass
     _watchers.setdefault(repo_id, []).append(ws)
 
 
@@ -40,190 +53,111 @@ def unregister_watcher(repo_id: str, ws: WebSocket) -> None:
 
 
 async def _try_send_json(ws: WebSocket, payload: dict) -> bool:
+    """Send and return False if the socket is closed/errored (so we can prune it)."""
     try:
         await ws.send_json(payload)
         return True
     except (WebSocketDisconnect, ConnectionClosedOK, ConnectionClosedError):
         return False
     except Exception:
-        # any other error: treat as closed to avoid loops
         return False
 
 
-def _coalesce_and_clip_progress(status_dict: dict) -> dict:
-    """
-    Translate a status.json dict into a compact progress payload:
-      {"phase": "...", "progress": <0-100 optional>, "message": optional}
-    Recognized phases: upload/clone -> "upload", "indexing", "indexed", "error"
-    """
-    phase_raw = (status_dict.get("status") or "").lower()
+# ---------------------------
+# broadcasting helpers
+# ---------------------------
+async def _send_to_all(repo_id: str, payload: dict) -> None:
+    """Coroutine: send to all watchers of repo_id and prune dead ones."""
+    watchers = list(_watchers.get(repo_id, []))
+    to_remove: List[WebSocket] = []
+    for ws in watchers:
+        ok = await _try_send_json(ws, payload)
+        if not ok:
+            to_remove.append(ws)
+    for ws in to_remove:
+        unregister_watcher(repo_id, ws)
 
-    # map a few common writers -> normalized phases
-    if phase_raw in {"upload", "uploading", "clone", "cloning"}:
-        phase = "upload"
-    elif phase_raw in {"index", "indexing"}:
-        phase = "indexing"
-    elif phase_raw in {"done", "indexed", "complete", "completed"}:
-        phase = "indexed"
-    elif phase_raw in {"error", "failed", "fail"}:
-        phase = "error"
+
+def broadcast(repo_id: str, payload: dict) -> None:
+    """
+    Thread-safe broadcast of an arbitrary payload to all watchers of repo_id.
+    Safe to call from worker threads.
+    """
+    # schedule directly
+    try:
+        loop = asyncio.get_running_loop()
+        if loop.is_running():
+            loop.create_task(_send_to_all(repo_id, payload))
+            return
+    except RuntimeError:
+        pass
+
+    # otherwise schedule onto the captured server loop
+    if _server_loop and _server_loop.is_running():
+        asyncio.run_coroutine_threadsafe(_send_to_all(repo_id, payload), _server_loop)
     else:
-        # unknown -> just pass through
-        phase = phase_raw or "unknown"
+        pass
 
-    msg = status_dict.get("message")
-
-    progress: Optional[int] = None
-    if phase == "indexing":
-        processed = int(status_dict.get("processed", 0) or 0)
-        total = int(status_dict.get("total", 0) or 0)
-        if total > 0:
-            progress = max(0, min(100, round((processed / total) * 100)))
-
-    payload = {"phase": phase}
-    if progress is not None:
-        payload["progress"] = progress
-    if msg:
-        payload["message"] = msg
-    return payload
-
-
-# ---------------------------
-# File-tail based streams
-# ---------------------------
-async def tail_status(ws: WebSocket, repo_id: str, interval: float = 10.0) -> None:
-    """
-    Polls <BASE>/<repo_id>/status.json periodically and streams the whole dict.
-    Stops on "indexed" or "error" (or client disconnect).
-    """
-    register_watcher(repo_id, ws)
-    status_path = BASE / repo_id / "status.json"
-    last_sent: Optional[str] = None  # cache of last json text
-
-    try:
-        while True:
-            await asyncio.sleep(interval)
-
-            if not status_path.exists():
-                # if the file isn't there yet, just keep waiting.
-                continue
-
-            try:
-                raw = status_path.read_text(encoding="utf-8")
-            except Exception:
-                # transient read error (being written), skip this tick
-                continue
-
-            if raw == last_sent:
-                # no change since last tick
-                continue
-
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-
-            # try to send; drop on failure
-            if not await _try_send_json(ws, data):
-                break
-
-            last_sent = raw
-
-            status = (data.get("status") or "").lower()
-            if status in {"indexed", "done", "error", "failed"}:
-                break
-    finally:
-        unregister_watcher(repo_id, ws)
-        try:
-            await ws.close()
-        except Exception:
-            pass
-
-
-async def stream_progress(ws: WebSocket, repo_id: str, interval: float = 1.0) -> None:
-    """
-    Polls <BASE>/<repo_id>/status.json and emits compact progress messages
-    like {"phase": "indexing", "progress": 42}.
-    Stops on "indexed" or "error" (or client disconnect).
-    """
-    register_watcher(repo_id, ws)
-    status_path = BASE / repo_id / "status.json"
-
-    # for coalescing
-    last_phase: Optional[str] = None
-    last_progress: Optional[int] = None
-    last_message: Optional[str] = None
-
-    try:
-        while True:
-            await asyncio.sleep(interval)
-
-            if not status_path.exists():
-                continue
-
-            try:
-                status_dict = json.loads(status_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                continue
-
-            payload = _coalesce_and_clip_progress(status_dict)
-            phase = payload.get("phase")
-            progress = payload.get("progress")
-            message = payload.get("message")
-
-            # only send when something changed
-            if (phase, progress, message) != (last_phase, last_progress, last_message):
-                if not await _try_send_json(ws, payload):
-                    break
-                last_phase, last_progress, last_message = phase, progress, message
-
-            if phase in {"indexed", "done", "error"}:
-                break
-    finally:
-        unregister_watcher(repo_id, ws)
-        try:
-            await ws.close()
-        except Exception:
-            pass
 
 def broadcast_progress(
     repo_id: str,
-    phase: str,
+    phase_or_payload: Union[str, dict],
     progress: Optional[int] = None,
     message: Optional[str] = None,
+    **extra: object,
 ) -> None:
     """
-    Fire-and-forget broadcast to all watchers of a repo.
-    Safe to call from async code (same loop) or other threads.
+    Convenience:
+      - broadcast_progress(repo_id, {"phase":"indexing", ...})
+      - broadcast_progress(repo_id, "indexing", progress=42, message="...")
     """
-    payload: dict = {"phase": phase}
-    if progress is not None:
-        payload["progress"] = max(0, min(100, int(progress)))
-    if message:
-        payload["message"] = message
+    if isinstance(phase_or_payload, dict):
+        payload = dict(phase_or_payload)  # shallow copy
+    else:
+        payload = {"phase": str(phase_or_payload)}
+        if progress is not None:
+            payload["progress"] = max(0, min(100, int(progress)))
+        if message:
+            payload["message"] = message
+        if extra:
+            payload.update(extra)
 
-    # schedule sends for all watchers; remove closed sockets
-    watchers = list(_watchers.get(repo_id, []))
-
-    async def _send_all() -> None:
-        to_remove: List[WebSocket] = []
-        for ws in watchers:
-            ok = await _try_send_json(ws, payload)
-            if not ok:
-                to_remove.append(ws)
-        for ws in to_remove:
-            unregister_watcher(repo_id, ws)
-
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_send_all())
-    except RuntimeError:
-        # not in an event loop (e.g., called from a worker thread)
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(_send_all())
-        finally:
-            loop.close()
+    broadcast(repo_id, payload)
 
 
 _broadcast = broadcast_progress
+
+
+# ---------------------------
+# stream function used by routes
+# ---------------------------
+async def stream_repo(ws: WebSocket, repo_id: str, keepalive_secs: float = 25.0) -> None:
+    """
+    Register the socket as a watcher and keep the connection open.
+    Actual progress events are pushed via `broadcast/_broadcast`.
+    Sends a periodic keepalive to help with idle proxy timeouts.
+    """
+    register_watcher(repo_id, ws)
+
+    try:
+        # send an initial no-op so the client knows the stream is alive
+        await _try_send_json(ws, {"event": "connected", "repoId": repo_id})
+
+        # keepalive loop; clients ignore frames that lack a `phase`
+        while True:
+            try:
+                await asyncio.sleep(keepalive_secs)
+                ok = await _try_send_json(ws, {"event": "keepalive"})
+                if not ok:
+                    break
+            except (WebSocketDisconnect, ConnectionClosedOK, ConnectionClosedError):
+                break
+            except Exception:
+                # swallow and continue; next tick will try again
+                pass
+    finally:
+        unregister_watcher(repo_id, ws)
+        try:
+            await ws.close()
+        except Exception:
+            pass
