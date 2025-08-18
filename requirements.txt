@@ -14,7 +14,7 @@ passlib
 pyjwt
 pydantic-settings>=0.2.2
 pydantic[email]
-tree-sitter-languages
-tree-sitter
+tree_sitter==0.20.4
+tree_sitter_languages==1.6.1
 jose
 aiofiles
