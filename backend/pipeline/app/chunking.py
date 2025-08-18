@@ -230,7 +230,7 @@ def chunk_code(
             logging.warning(f"Tree-sitter parsing failed for {path}: {e}")
             chunks = []
 
-    # Fallback (or supplement if parser produced nothing):
+    # fallback
     if not chunks:
         # slide a window over all lines
         chunks = split_windowed(0, n_lines)
