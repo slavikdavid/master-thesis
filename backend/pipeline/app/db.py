@@ -3,7 +3,7 @@ import os
 import psycopg
 from psycopg.rows import dict_row
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_DSN")
 
 # async connection pool
 pool: psycopg.AsyncConnection = None
