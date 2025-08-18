@@ -54,7 +54,6 @@ export function RepoSelect({
 
   useEffect(() => {
     fetchConversations();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reloadKey]);
 
   const repos: RepoGroup[] = useMemo(() => {

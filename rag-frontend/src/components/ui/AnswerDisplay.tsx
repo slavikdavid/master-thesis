@@ -5,7 +5,7 @@ import React, {
   useRef,
   useState,
 } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
@@ -24,7 +24,7 @@ type ContextMeta = {
 interface Props {
   answer: string;
   className?: string;
-  /** optional streaming type-out */
+  /** streaming type-out */
   stream?: boolean;
   /** characters per second for typing effect when streaming */
   cps?: number;
@@ -44,9 +44,24 @@ function stripThinkBlocks(md: string): string {
   return out;
 }
 
+/** convert 1-line code blocks to inline code */
+function normalizeOneLineFences(md: string): string {
+  // ```lang\ncontent\n```  -> `content`
+  md = md.replace(
+    /```[a-z0-9_-]*\s*\n([^\n`]{1,120})\n```/gi,
+    (_, s1: string) => `\`${s1.trim()}\``
+  );
+  // ```content``` (same line open/close) -> `content`
+  md = md.replace(
+    /```[a-z0-9_-]*\s*([^\n`]{1,120})\s*```/gi,
+    (_, s1: string) => `\`${s1.trim()}\``
+  );
+  return md;
+}
+
 /** escape < and > outside code so generics render correctly. */
 function escapeAnglesOutsideCode(md: string): string {
-  const cleaned = stripThinkBlocks(md);
+  const cleaned = stripThinkBlocks(normalizeOneLineFences(md));
 
   // convert <https://...> and <mailto:...> to markdown links to not escape them.
   const linkFixed = cleaned.replace(
@@ -119,6 +134,14 @@ function useStreamingText(fullText: string, enabled: boolean, cps = 80) {
 
 /* ---------------- code block renderer ---------------- */
 
+function looksLikeIdentifier(s: string) {
+  // single line, short, and composed of common identifier/file chars
+  if (!s || s.length > 120) return false;
+  if (s.includes("\n") || s.includes("\r")) return false;
+  // allow letters, numbers, underscore, dash, dot, slash, colon, at
+  return /^[A-Za-z0-9_\-./:@]+$/.test(s.trim());
+}
+
 const CodeBlock: React.FC<{
   inline?: boolean;
   className?: string;
@@ -141,10 +164,10 @@ const CodeBlock: React.FC<{
     );
   }, [code]);
 
-  // inline backticks stay inline
-  if (inline) {
+  // force inline for identifiers
+  if (inline || looksLikeIdentifier(code)) {
     return (
-      <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded font-mono text-[0.9em]">
+      <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded font-mono text-[0.9em] align-baseline">
         {code}
       </code>
     );
@@ -188,6 +211,27 @@ const CodeBlock: React.FC<{
       </SyntaxHighlighter>
     </div>
   );
+};
+
+/* ---------------- paragraph renderer that unwraps single inline-code ---------------- */
+
+const ParagraphMaybeInline: Components["p"] = ({ node, children }) => {
+  const pNode = node as any;
+  const kids = (pNode?.children ?? []) as Array<any>;
+  const nonSpaceKids = kids.filter(
+    (k) => !(k.type === "text" && String(k.value || "").trim() === "")
+  );
+
+  if (nonSpaceKids.length === 1 && nonSpaceKids[0].type === "inlineCode") {
+    const value = String(nonSpaceKids[0].value ?? "");
+    return (
+      <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded font-mono text-[0.9em] align-baseline">
+        {value}
+      </code>
+    );
+  }
+
+  return <p className="whitespace-pre-wrap break-words">{children}</p>;
 };
 
 /* ---------------- context chip ---------------- */
@@ -382,9 +426,8 @@ export function AnswerDisplay({
                   {children}
                 </div>
               ),
-              p: ({ children }) => (
-                <p className="whitespace-pre-wrap break-words">{children}</p>
-              ),
+              // unwrap paragraphs that contain only a single inline code token
+              p: ParagraphMaybeInline,
             }}
           >
             {streamingText}

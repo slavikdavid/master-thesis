@@ -74,7 +74,8 @@ export default function Sidebar({
       <div className="flex-1 overflow-auto p-2 space-y-1">
         {repoIds.length === 0 && (
           <div className="text-xs text-gray-500 p-2">
-            No conversations yet. Click “New repo” to upload or create a chat.
+            No conversations yet. Click “New repo” to upload a codebase or
+            create a chat under already uploaded repo.
           </div>
         )}
 

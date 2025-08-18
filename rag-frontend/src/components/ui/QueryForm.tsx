@@ -1,33 +1,22 @@
 // src/components/QueryForm.tsx
-import { useState, useEffect, useRef, useCallback } from "react";
+
+import { useState, useCallback, useRef, useEffect } from "react";
 import { Textarea } from "../ui/textarea";
 import { Button } from "../ui/button";
 import { toast } from "../../lib/toast";
 import axios from "axios";
 import { useAuth } from "../../context/AuthContext";
 
-import { IndexStatus } from "./IndexStatus";
 import { FileTree } from "./FileTree";
+import { useRepoProgress } from "../../hooks/useRepoProgress";
+import RepoProgress from "./RepoProgress";
 
 interface Props {
   repoId: string;
   onAsk: (question: string) => void;
   onAnswer: (answer: string) => void;
-  onSelectFile: (filePath: string) => void;
+  onSelectFile: (filePath: string, content: string) => void;
 }
-
-type StatusMsg = {
-  status?: "upload" | "indexing" | "indexed" | "done" | "error" | string;
-  message?: string;
-  processed?: number;
-  total?: number;
-};
-
-type ProgressMsg = {
-  phase?: "upload" | "indexing" | "indexed" | "done" | "error" | string;
-  progress?: number | null;
-  message?: string;
-};
 
 export function QueryForm({ repoId, onAsk, onAnswer, onSelectFile }: Props) {
   const { token } = useAuth();
@@ -36,31 +25,44 @@ export function QueryForm({ repoId, onAsk, onAnswer, onSelectFile }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // live status UI
-  const [phase, setPhase] = useState<string>("idle");
-  const [progress, setProgress] = useState<number>(0);
+  // unified progress bar (upload + embedding + indexing)
+  const {
+    phases,
+    uploadPct,
+    embeddingPct,
+    indexingPct,
+    overallPct,
+    isIndexed,
+    hasError,
+  } = useRepoProgress(repoId);
 
-  const statusWs = useRef<WebSocket | null>(null);
-  const progWs = useRef<WebSocket | null>(null);
+  // show toast on completion / error (once)
+  const doneRef = useRef(false);
+  useEffect(() => {
+    doneRef.current = false; // reset when repo changes
+  }, [repoId]);
+
+  useEffect(() => {
+    if (!doneRef.current && isIndexed) {
+      doneRef.current = true;
+      toast.success("Indexing complete!");
+    }
+    if (hasError) {
+      toast.error("Indexing failed. Check logs/status.");
+    }
+  }, [isIndexed, hasError]);
 
   const disabled = loading || !question.trim();
-
-  const buildWsUrl = useCallback(
-    (path: "/api/ws/status" | "/api/ws/progress") => {
-      const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-      const qs = new URLSearchParams({
-        token: token ?? "",
-        repo_id: repoId,
-      }).toString();
-      return `${scheme}://${window.location.host}${path}?${qs}`;
-    },
-    [repoId, token]
-  );
 
   // ask the backend for an answer
   const ask = useCallback(async () => {
     const q = question.trim();
     if (!q) return;
+
+    if (!isIndexed) {
+      setError("Indexing is not finished yet.");
+      return;
+    }
 
     onAsk(q);
     setLoading(true);
@@ -93,148 +95,7 @@ export function QueryForm({ repoId, onAsk, onAnswer, onSelectFile }: Props) {
     } finally {
       setLoading(false);
     }
-  }, [question, repoId, token, onAsk, onAnswer]);
-
-  // STATUS WS (streams whole status objects)
-  useEffect(() => {
-    if (!repoId || !token) return;
-
-    let shouldReconnect = true;
-    let attempt = 0;
-    let closedByUs = false;
-
-    const connect = () => {
-      const url = buildWsUrl("/api/ws/status");
-      const ws = new WebSocket(url);
-      statusWs.current = ws;
-
-      ws.onopen = () => {
-        attempt = 0;
-      };
-
-      ws.onmessage = (evt) => {
-        let msg: StatusMsg | null = null;
-        try {
-          msg = JSON.parse(evt.data);
-        } catch {
-          return;
-        }
-        const s = (msg?.status || "").toLowerCase();
-        if (s) setPhase(s);
-
-        if (
-          s === "indexing" &&
-          typeof msg?.processed === "number" &&
-          typeof msg?.total === "number" &&
-          (msg?.total ?? 0) > 0
-        ) {
-          setProgress(
-            Math.max(
-              0,
-              Math.min(100, Math.round((msg.processed! / msg.total!) * 100))
-            )
-          );
-        }
-
-        if (s === "indexed" || s === "done") {
-          setProgress(100);
-          toast.success("Indexing complete!");
-          shouldReconnect = false;
-          closedByUs = true;
-          try {
-            ws.close(1000, "indexed");
-          } catch {}
-        } else if (s === "error") {
-          toast.error(msg?.message || "Indexing failed");
-          shouldReconnect = false;
-          closedByUs = true;
-          try {
-            ws.close(1011, "error");
-          } catch {}
-        }
-      };
-
-      ws.onclose = () => {
-        statusWs.current = null;
-        if (closedByUs || !shouldReconnect) return;
-        const delay = Math.min(10000, 500 * 2 ** attempt);
-        attempt += 1;
-        setTimeout(connect, delay);
-      };
-    };
-
-    connect();
-    return () => {
-      shouldReconnect = false;
-      try {
-        statusWs.current?.close(1000, "unmount");
-      } catch {}
-      statusWs.current = null;
-    };
-  }, [repoId, token, buildWsUrl]);
-
-  // PROGRESS WS (compact {"phase","progress"})
-  useEffect(() => {
-    if (!repoId || !token) return;
-
-    let shouldReconnect = true;
-    let attempt = 0;
-    let closedByUs = false;
-
-    const connect = () => {
-      const url = buildWsUrl("/api/ws/progress");
-      const ws = new WebSocket(url);
-      progWs.current = ws;
-
-      ws.onopen = () => {
-        attempt = 0;
-      };
-
-      ws.onmessage = (evt) => {
-        let msg: ProgressMsg | null = null;
-        try {
-          msg = JSON.parse(evt.data);
-        } catch {
-          return;
-        }
-
-        if (msg?.phase) setPhase(String(msg.phase).toLowerCase());
-        if (typeof msg?.progress === "number") setProgress(msg.progress);
-
-        if (msg?.phase === "indexed" || msg?.phase === "done") {
-          setProgress(100);
-          shouldReconnect = false;
-          closedByUs = true;
-          try {
-            ws.close(1000, "done");
-          } catch {}
-        } else if (msg?.phase === "error") {
-          shouldReconnect = false;
-          closedByUs = true;
-          try {
-            ws.close(1011, "error");
-          } catch {}
-        }
-      };
-
-      ws.onclose = () => {
-        progWs.current = null;
-        if (closedByUs || !shouldReconnect) return;
-        const delay = Math.min(10000, 500 * 2 ** attempt);
-        attempt += 1;
-        setTimeout(connect, delay);
-      };
-    };
-
-    connect();
-    return () => {
-      shouldReconnect = false;
-      try {
-        progWs.current?.close(1000, "unmount");
-      } catch {}
-      progWs.current = null;
-    };
-  }, [repoId, token, buildWsUrl]);
+  }, [question, repoId, token, onAsk, onAnswer, isIndexed]);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
@@ -245,7 +106,15 @@ export function QueryForm({ repoId, onAsk, onAnswer, onSelectFile }: Props) {
 
   return (
     <div className="space-y-4">
-      <IndexStatus phase={phase} progress={progress} />
+      {/* multi-phase progress (overall + per phase) via repo progress component */}
+      <RepoProgress
+        upload={{ status: phases.upload.status, pct: uploadPct }}
+        embedding={{ status: phases.embedding.status, pct: embeddingPct }}
+        indexing={{ status: phases.indexing.status, pct: indexingPct }}
+        overallPct={overallPct}
+      />
+
+      {/* live file tree */}
       <FileTree repoId={repoId} onSelectFile={onSelectFile} />
 
       <Textarea
@@ -258,8 +127,8 @@ export function QueryForm({ repoId, onAsk, onAnswer, onSelectFile }: Props) {
 
       {error && <div className="text-red-500 text-sm">{error}</div>}
 
-      <Button onClick={ask} disabled={disabled}>
-        {loading ? "Thinking…" : "Ask"}
+      <Button onClick={ask} disabled={disabled || !isIndexed}>
+        {loading ? "Thinking…" : isIndexed ? "Ask" : "Indexing…"}
       </Button>
     </div>
   );
