@@ -59,11 +59,13 @@ Before building, it is necessary to create a `.env` file in root directory of th
 
 ```ini
 GROQ_API_KEY=<your_groq_api_key>
+VOYAGE_API_KEY=<your_voyage_api_key>
+VOYAGE_MODEl=<voyage-code-2 OR voyage-code-3>
 
 POSTGRES_USER=<your_db_user>
 POSTGRES_PASSWORD=<your_db_password>
 POSTGRES_DB=<your_db_name>
-DATABASE_URL=postgresql://<user>:<password>@<host>:<port>/<dbname>
+DATABASE_DSN=postgresql://<user>:<password>@<host>:<port>/<dbname>
 
 JWT_SECRET=<replace_with_a_random_secret>
 JWT_ALGORITHM=HS256
