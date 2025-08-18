@@ -1,12 +1,26 @@
 // src/components/Sidebar.tsx
-import React from "react";
+import React, { useState } from "react";
 import {
   Plus,
   Search,
   ChevronRight,
   ChevronDown,
   MessageSquare,
+  Trash,
+  Loader2,
 } from "lucide-react";
+
+import {
+  AlertDialog,
+  AlertDialogTrigger,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogCancel,
+  AlertDialogAction,
+} from "@/components/ui/alert-dialog";
 
 export type Conversation = {
   id: string;
@@ -21,7 +35,6 @@ type SidebarProps = {
   convosByRepo: Record<string, Conversation[]>;
   expanded: Record<string, boolean>;
   search: string;
-
   activeConversationId?: string | null;
 
   onSearchChange: (v: string) => void;
@@ -30,6 +43,8 @@ type SidebarProps = {
   onNewChat: (repoId: string) => void;
   onNewRepo: () => void;
   onSelectRepo?: (repoId: string) => void;
+
+  onDeleteConvo?: (repoId: string, convoId: string) => Promise<void> | void;
 };
 
 export default function Sidebar({
@@ -43,11 +58,32 @@ export default function Sidebar({
   onNewChat,
   onNewRepo,
   onSelectRepo,
+  onDeleteConvo,
 }: SidebarProps) {
   const repoIds = Object.keys(convosByRepo);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const convoLabel = (c: Conversation) =>
     c.title || c.latest_question || `Conversation ${c.id.slice(0, 8)}`;
+
+  async function handleDelete(repoId: string, convoId: string) {
+    setDeletingId(convoId);
+    try {
+      if (onDeleteConvo) {
+        await onDeleteConvo(repoId, convoId);
+      } else {
+        const res = await fetch(`/api/conversations/${convoId}`, {
+          method: "DELETE",
+        });
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          throw new Error(text || `Failed to delete conversation ${convoId}`);
+        }
+      }
+    } finally {
+      setDeletingId(null);
+    }
+  }
 
   return (
     <aside className="border-r border-gray-200 dark:border-gray-800 bg-white dark:bg-[rgb(10,10,12)] flex flex-col min-h-0">
@@ -134,20 +170,76 @@ export default function Sidebar({
                       No conversations.
                     </div>
                   )}
+
                   {convos.map((c) => {
                     const active = c.id === activeConversationId;
+                    const label = convoLabel(c);
+
                     return (
-                      <button
+                      <div
                         key={c.id}
-                        className={`w-full text-left flex items-center gap-2 px-2 py-2 text-xs rounded hover:bg-gray-50 dark:hover:bg-gray-800 ${
-                          active ? "bg-gray-100 dark:bg-gray-800" : ""
+                        className={`group flex items-center gap-2 px-2 py-2 text-xs rounded ${
+                          active
+                            ? "bg-gray-100 dark:bg-gray-800"
+                            : "hover:bg-gray-50 dark:hover:bg-gray-800"
                         }`}
-                        onClick={() => onSelectConvo(rid, c.id)}
-                        title={convoLabel(c) || undefined}
                       >
-                        <MessageSquare className="h-3.5 w-3.5 shrink-0" />
-                        <span className="truncate">{convoLabel(c)}</span>
-                      </button>
+                        <button
+                          className="flex-1 text-left inline-flex items-center gap-2 min-w-0"
+                          onClick={() => onSelectConvo(rid, c.id)}
+                          title={label || undefined}
+                        >
+                          <MessageSquare className="h-3.5 w-3.5 shrink-0" />
+                          <span className="truncate">{label}</span>
+                        </button>
+
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <button
+                              className="shrink-0 p-1 rounded opacity-80 hover:opacity-100 hover:bg-gray-100 dark:hover:bg-gray-700"
+                              onClick={(e) => e.stopPropagation()}
+                              aria-label="Delete conversation"
+                              title="Delete conversation"
+                            >
+                              {deletingId === c.id ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                              ) : (
+                                <Trash className="h-4 w-4" />
+                              )}
+                            </button>
+                          </AlertDialogTrigger>
+
+                          <AlertDialogContent
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>
+                                Delete this conversation?
+                              </AlertDialogTitle>
+                              <AlertDialogDescription>
+                                This action cannot be undone. The conversation
+                                and its messages will be permanently deleted.
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                No
+                              </AlertDialogCancel>
+                              <AlertDialogAction
+                                onClick={async (e) => {
+                                  e.stopPropagation();
+                                  await handleDelete(rid, c.id);
+                                }}
+                                className="bg-red-600 text-white hover:bg-red-700"
+                              >
+                                Yes, delete
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
+                      </div>
                     );
                   })}
                 </div>
