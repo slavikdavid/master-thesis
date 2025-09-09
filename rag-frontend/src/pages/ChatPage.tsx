@@ -1,3 +1,4 @@
+// src/pages/ChatPage.tsx
 import React, {
   useState,
   useEffect,
@@ -10,27 +11,27 @@ import { UploadForm } from "../components/ui/UploadForm";
 import { AnswerDisplay } from "../components/ui/AnswerDisplay";
 import { useAuth } from "../context/AuthContext";
 import { useNavigate, useParams } from "react-router-dom";
-import { QueryHistory } from "../components/ui/QueryHistory";
 import Sidebar, { Conversation } from "../components/ui/Sidebar";
 import { QueryForm } from "../components/ui/QueryForm";
+import { FileTree } from "../components/ui/FileTree";
 
+/* ---------- types ---------- */
 type ContextItem = {
   id?: string;
+  filename?: string;
+  content?: string;
+  score?: number;
   file?: string;
   snippet?: string;
-  content?: string;
   metadata?: any;
-  score?: number;
 };
-
 interface ChatMessage {
   id: string;
   content: string;
   role: "user" | "assistant";
+  created_at?: string | null;
   contexts?: ContextItem[];
 }
-
-/** Backend PhaseState (mirror of FastAPI model) */
 type PhaseState = {
   status?: "queued" | "running" | "complete" | "error" | string;
   processed?: number;
@@ -40,8 +41,6 @@ type PhaseState = {
   startedAt?: number;
   finishedAt?: number;
 };
-
-/** Backend /repos/:id/status response */
 type RepoStatus = {
   repoId: string;
   status:
@@ -56,17 +55,57 @@ type RepoStatus = {
   phases: Record<string, PhaseState>;
   stats?: { documents?: number; [k: string]: any };
 };
+type HistoryRow = {
+  message_id: string | null;
+  rag_query_id: string;
+  created_at?: string | null;
+  contexts: Array<{
+    id: string;
+    filename: string;
+    content: string;
+    rank?: number | null;
+    score?: number | null;
+  }>;
+};
 
 const LS_REPO = "lastRepoId";
 const LS_CONV = "lastConversationId";
+const LS_RIGHT_OPEN = "chat:rightOpen";
+const LS_RIGHT_W = "chat:rightWidth";
 
-/** normalize API conversation */
+/* ---------- tiny context cache ---------- */
+const ctxKey = (cid: string) => `ctxcache:${cid}`;
+function readCtxCache(cid: string): Record<string, ContextItem[]> {
+  try {
+    const raw = localStorage.getItem(ctxKey(cid));
+    if (!raw) return {};
+    const obj = JSON.parse(raw);
+    return typeof obj === "object" && obj ? obj : {};
+  } catch {
+    return {};
+  }
+}
+function writeCtxCache(cid: string, map: Record<string, ContextItem[]>) {
+  try {
+    localStorage.setItem(ctxKey(cid), JSON.stringify(map));
+  } catch {}
+}
+function mergeCtxCache(
+  cid: string,
+  add: Record<string, ContextItem[]>
+): Record<string, ContextItem[]> {
+  const base = readCtxCache(cid);
+  const merged = { ...base, ...add };
+  writeCtxCache(cid, merged);
+  return merged;
+}
+
+/* ---------- helpers ---------- */
 function normalizeConvo(raw: any): Conversation | null {
   const id =
     raw?.id ?? raw?.conversation_id ?? raw?.conversationId ?? raw?.pk ?? null;
   const repo_id = raw?.repo_id ?? raw?.repoId ?? raw?.repository_id ?? null;
   if (!id || !repo_id) return null;
-
   return {
     id: String(id),
     repo_id: String(repo_id),
@@ -82,53 +121,90 @@ function normalizeConvo(raw: any): Conversation | null {
   };
 }
 
+/* ---------- component ---------- */
 export default function ChatPage() {
-  const { token } = useAuth();
+  const { token, user } = useAuth();
   const navigate = useNavigate();
   const params = useParams<{ id?: string }>();
   const routeConversationId = params.id || null;
 
-  const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [repoId, setRepoId] = useState<string | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [isAsking, setIsAsking] = useState(false);
 
-  const [newRepoMode, setNewRepoMode] = useState(false);
-
-  // sidebar state
   const [allConvos, setAllConvos] = useState<Conversation[]>([]);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [search, setSearch] = useState("");
 
-  // repo status (authoritative, from backend)
   const [repoStatus, setRepoStatus] = useState<RepoStatus | null>(null);
-  // fallback "ready" if we’ve already successfully answered at least once
   const [manuallyReady, setManuallyReady] = useState(false);
 
   const lastRepoRef = useRef<string | null>(null);
   const restoreDoneRef = useRef(false);
   const [reloadKey, setReloadKey] = useState(0);
 
-  // --- AUTOSCROLL SENTINEL ---
   const scrollAreaRef = useRef<HTMLDivElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
-    if (bottomRef.current) {
-      bottomRef.current.scrollIntoView({ behavior, block: "end" });
-    } else if (scrollAreaRef.current) {
+    if (bottomRef.current) bottomRef.current.scrollIntoView({ behavior });
+    else if (scrollAreaRef.current) {
       const el = scrollAreaRef.current;
       el.scrollTop = el.scrollHeight;
     }
   }, []);
 
-  // keep conversationId in sync with route
+  /* ---------- Right pane (FileTree + Preview) ---------- */
+  const [rightOpen, setRightOpen] = useState<boolean>(() => {
+    const raw = localStorage.getItem(LS_RIGHT_OPEN);
+    return raw ? raw === "1" : true;
+  });
+  const [rightWidth, setRightWidth] = useState<number>(() => {
+    const raw = Number(localStorage.getItem(LS_RIGHT_W));
+    return Number.isFinite(raw) && raw >= 280 ? raw : 380;
+  });
+  useEffect(() => {
+    localStorage.setItem(LS_RIGHT_OPEN, rightOpen ? "1" : "0");
+  }, [rightOpen]);
+  useEffect(() => {
+    localStorage.setItem(LS_RIGHT_W, String(rightWidth));
+  }, [rightWidth]);
+
+  // drag to resize
+  const dragRef = useRef<{ startX: number; startW: number } | null>(null);
+  const onDragStart = (e: React.MouseEvent) => {
+    dragRef.current = { startX: e.clientX, startW: rightWidth };
+    window.addEventListener("mousemove", onDragging);
+    window.addEventListener("mouseup", onDragEnd);
+  };
+  const onDragging = (e: MouseEvent) => {
+    if (!dragRef.current) return;
+    const delta = dragRef.current.startX - e.clientX;
+    const next = Math.min(640, Math.max(280, dragRef.current.startW + delta));
+    setRightWidth(next);
+  };
+  const onDragEnd = () => {
+    dragRef.current = null;
+    window.removeEventListener("mousemove", onDragging);
+    window.removeEventListener("mouseup", onDragEnd);
+  };
+
+  const [previewPath, setPreviewPath] = useState<string | null>(null);
+  const [previewContent, setPreviewContent] = useState<string>("");
+
+  const handleSelectFile = useCallback((path: string, content: string) => {
+    setPreviewPath(path);
+    setPreviewContent(content);
+  }, []);
+
+  /* route → conversation id */
   useEffect(() => {
     setConversationId(routeConversationId);
     if (routeConversationId) setNewRepoMode(false);
   }, [routeConversationId]);
+  const [newRepoMode, setNewRepoMode] = useState(false);
 
-  // when landing on /conversation/:id, fetch it to learn repo_id
+  /* discover repo_id for a conversation */
   useEffect(() => {
     if (!routeConversationId) return;
     (async () => {
@@ -137,8 +213,7 @@ export default function ChatPage() {
           headers: token ? { Authorization: `Bearer ${token}` } : undefined,
         });
         if (!res.ok) return;
-        const raw = await res.json();
-        const conv = normalizeConvo(raw);
+        const conv = normalizeConvo(await res.json());
         if (conv) {
           setRepoId(conv.repo_id);
           localStorage.setItem(LS_REPO, conv.repo_id);
@@ -149,19 +224,17 @@ export default function ChatPage() {
     })();
   }, [routeConversationId, token]);
 
-  // restore last session only on root route
+  /* restore last session (root only) */
   useEffect(() => {
     if (restoreDoneRef.current) return;
     restoreDoneRef.current = true;
     if (routeConversationId) return;
-
     const savedRepo = localStorage.getItem(LS_REPO);
     const savedConv = localStorage.getItem(LS_CONV);
     if (savedRepo) setRepoId(savedRepo);
     if (savedConv) setConversationId(savedConv);
   }, [routeConversationId]);
 
-  // persist selections
   useEffect(() => {
     if (repoId) localStorage.setItem(LS_REPO, repoId);
   }, [repoId]);
@@ -169,7 +242,7 @@ export default function ChatPage() {
     if (conversationId) localStorage.setItem(LS_CONV, conversationId);
   }, [conversationId]);
 
-  // -------- fetch ALL conversations; group by repo_id --------
+  /* list conversations */
   const fetchAllConversations = useCallback(async () => {
     try {
       const res = await fetch("/api/conversations", {
@@ -189,7 +262,6 @@ export default function ChatPage() {
         .map(normalizeConvo)
         .filter(Boolean) as Conversation[];
       setAllConvos(list);
-
       if (!routeConversationId && !conversationId && list[0]) {
         setRepoId(list[0].repo_id);
         setConversationId(list[0].id);
@@ -203,12 +275,9 @@ export default function ChatPage() {
     void fetchAllConversations();
   }, [fetchAllConversations, reloadKey]);
 
-  // build repo → conversations map
   const convosByRepo = useMemo(() => {
     const map: Record<string, Conversation[]> = {};
-    for (const c of allConvos) {
-      (map[c.repo_id] = map[c.repo_id] || []).push(c);
-    }
+    for (const c of allConvos) (map[c.repo_id] = map[c.repo_id] || []).push(c);
     for (const rid of Object.keys(map)) {
       map[rid].sort((a, b) => {
         const at = Date.parse(b.updated_at || b.created_at || "") || 0;
@@ -219,7 +288,6 @@ export default function ChatPage() {
     return map;
   }, [allConvos]);
 
-  // filter conversations by search term
   const filteredConvosByRepo = useMemo(() => {
     const term = search.trim().toLowerCase();
     if (!term) return convosByRepo;
@@ -239,42 +307,172 @@ export default function ChatPage() {
     return out;
   }, [search, convosByRepo]);
 
-  // -------- load messages when conversation changes --------
+  /* -------- messages + contexts/history + cache -------- */
+  const reqSeqRef = useRef(0);
+  const [ctxHistory, setCtxHistory] = useState<HistoryRow[]>([]);
+  const [ctxByMessage, setCtxByMessage] = useState<
+    Record<string, ContextItem[]>
+  >({});
+
   useEffect(() => {
     if (!conversationId) {
       setChatHistory([]);
+      setCtxHistory([]);
+      setCtxByMessage({});
       return;
     }
+
+    const seq = ++reqSeqRef.current;
     const ctrl = new AbortController();
+
     (async () => {
       try {
-        const url = `/api/messages?conversation_id=${encodeURIComponent(
-          conversationId
-        )}`;
-        const res = await fetch(url, {
-          signal: ctrl.signal,
-          headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-        });
-        if (!res.ok) {
-          console.error("Load messages failed:", res.status, await res.text());
-          return;
+        // 1) messages
+        const msgRes = await fetch(
+          `/api/messages?conversation_id=${encodeURIComponent(conversationId)}`,
+          {
+            signal: ctrl.signal,
+            headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+          }
+        );
+        if (!msgRes.ok) return;
+        const rawMsgs: any[] = (await msgRes.json()) || [];
+        let msgs: ChatMessage[] = rawMsgs
+          .map((m) => ({
+            id: String(m.id),
+            role: m.role,
+            content: m.content,
+            created_at: m.created_at ?? m.createdAt ?? null,
+          }))
+          .sort((a, b) => {
+            const ta = a.created_at ? Date.parse(a.created_at) : 0;
+            const tb = b.created_at ? Date.parse(b.created_at) : 0;
+            return ta - tb;
+          });
+
+        // 2) hydrate from local cache
+        const cached = readCtxCache(conversationId);
+        msgs = msgs.map((m) =>
+          m.role === "assistant" && cached[m.id]?.length
+            ? { ...m, contexts: cached[m.id] }
+            : m
+        );
+
+        if (seq === reqSeqRef.current && !ctrl.signal.aborted) {
+          setChatHistory(msgs);
+          requestAnimationFrame(() => scrollToBottom("auto"));
         }
-        const msgs: ChatMessage[] = await res.json();
-        setChatHistory(Array.isArray(msgs) ? msgs : []);
-        requestAnimationFrame(() => scrollToBottom("auto"));
+
+        // 3) authoritative contexts/history
+        let history: HistoryRow[] = [];
+        try {
+          const ctxRes = await fetch(
+            `/api/conversations/${encodeURIComponent(
+              conversationId
+            )}/contexts/history`,
+            {
+              signal: ctrl.signal,
+              headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+            }
+          );
+          if (ctxRes.ok)
+            history = ((await ctxRes.json()) || []) as HistoryRow[];
+        } catch {}
+
+        // map by message id
+        const byMessage: Record<string, ContextItem[]> = {};
+        const leftovers: HistoryRow[] = [];
+        for (const row of history) {
+          const items =
+            (row?.contexts || []).map((c) => ({
+              id: c.id,
+              filename: c.filename,
+              content: c.content,
+              score: c.score ?? undefined,
+            })) || [];
+          if (row.message_id) byMessage[row.message_id] = items;
+          else leftovers.push(row);
+        }
+
+        // merge with existing msgs
+        const toPersist: Record<string, ContextItem[]> = {};
+        const merged = msgs.map((m) => {
+          if (m.role !== "assistant") return m;
+          const server = byMessage[m.id];
+          if (server?.length) {
+            toPersist[m.id] = server;
+            return { ...m, contexts: server };
+          }
+          if (m.contexts?.length) {
+            toPersist[m.id] = m.contexts;
+            return m;
+          }
+          return m;
+        });
+
+        // assign leftovers to newest answers without contexts (best-effort)
+        if (leftovers.length) {
+          const idxs = merged
+            .map((m, i) =>
+              m.role === "assistant" && !m.contexts?.length ? i : -1
+            )
+            .filter((i) => i >= 0);
+          const assign = Math.min(idxs.length, leftovers.length);
+          for (let k = 0; k < assign; k++) {
+            const i = idxs[idxs.length - 1 - k];
+            const row = leftovers[k];
+            const items =
+              (row?.contexts || []).map((c) => ({
+                id: c.id,
+                filename: c.filename,
+                content: c.content,
+                score: c.score ?? undefined,
+              })) || [];
+            merged[i] = { ...merged[i], contexts: items };
+            toPersist[merged[i].id] = items;
+          }
+        }
+
+        const persisted = mergeCtxCache(conversationId, toPersist);
+        if (seq === reqSeqRef.current && !ctrl.signal.aborted) {
+          setChatHistory(merged);
+          setCtxHistory(history);
+          setCtxByMessage(persisted);
+        }
       } catch (e: any) {
-        if (e.name !== "AbortError") console.error("Load messages error:", e);
+        if (e?.name !== "AbortError")
+          console.error("Load conversation error:", e);
       }
     })();
+
     return () => ctrl.abort();
   }, [conversationId, token, scrollToBottom]);
 
-  // -------- SINGLE CHECK: fetch repo status whenever repoId changes ----
+  /* -------- derive “Used in this conversation” -------- */
+  const { usedCounts, usedSamples } = useMemo(() => {
+    const counts: Record<string, number> = {};
+    const samples: Record<string, string> = {};
+    const push = (f: string | undefined, c: string | undefined) => {
+      if (!f) return;
+      counts[f] = (counts[f] || 0) + 1;
+      if (c && !samples[f]) samples[f] = c.slice(0, 240);
+    };
+    // collect from per-message cache
+    Object.values(ctxByMessage || {}).forEach((arr) =>
+      (arr || []).forEach((x) => push(x.filename, x.content))
+    );
+    // also collect from history rows
+    (ctxHistory || []).forEach((row) =>
+      (row.contexts || []).forEach((x) => push(x.filename, x.content))
+    );
+    return { usedCounts: counts, usedSamples: samples };
+  }, [ctxByMessage, ctxHistory, conversationId]);
+
+  /* -------- repo status -------- */
   useEffect(() => {
-    setManuallyReady(false); // reset fallback when switching repos
+    setManuallyReady(false);
     setRepoStatus(null);
     if (!repoId) return;
-
     (async () => {
       try {
         const res = await fetch(`/api/repos/${repoId}/status`, {
@@ -283,20 +481,16 @@ export default function ChatPage() {
         if (!res.ok) return;
         const s = (await res.json().catch(() => null)) as RepoStatus | null;
         setRepoStatus(s || null);
-
-        // If backend already proves readiness, latch it to avoid UI flip-flop
         const label = (s?.status || "").toLowerCase();
         const docs = Number(s?.stats?.documents || 0);
         if (label === "indexed" || label === "done" || docs > 0) {
           setManuallyReady(true);
         }
-      } catch {
-        // keep as null; UI will still allow asking once we get an answer (fallback toggles ready)
-      }
+      } catch {}
     })();
   }, [repoId, token]);
 
-  // set repo & create a new conversation
+  /* repo selection / create convo */
   const handleRepoId = useCallback(
     async (newRepoId: string) => {
       if (lastRepoRef.current !== newRepoId) {
@@ -304,7 +498,6 @@ export default function ChatPage() {
         lastRepoRef.current = newRepoId;
       }
       setRepoId(newRepoId);
-
       try {
         const res = await fetch("/api/conversations", {
           method: "POST",
@@ -336,7 +529,6 @@ export default function ChatPage() {
     (id: string) => {
       toast.success("Repository ready");
       if (!repoId) setRepoId(id);
-      // mark ready immediately (terminal); also set a nonzero documents count
       setRepoStatus({
         repoId: id,
         status: "indexed",
@@ -349,7 +541,6 @@ export default function ChatPage() {
     [repoId]
   );
 
-  // ensure a conversation exists
   const ensureConversation = useCallback(
     async (rid: string) => {
       if (conversationId) return conversationId;
@@ -373,13 +564,11 @@ export default function ChatPage() {
     [conversationId, token, navigate]
   );
 
-  /** Local signal that we already have valid assistant output (helps on F5). */
   const hasAssistantHistory = useMemo(
     () => chatHistory.some((m) => m.role === "assistant"),
     [chatHistory]
   );
 
-  // compute readiness: backend says indexed/done OR we already answered OR we have docs
   const isRepoReady = useMemo(() => {
     const label = (repoStatus?.status || "").toLowerCase();
     const docs = Number(repoStatus?.stats?.documents || 0);
@@ -392,12 +581,12 @@ export default function ChatPage() {
     );
   }, [repoStatus, manuallyReady, hasAssistantHistory]);
 
-  // ask flow
+  /* ask */
   const handleAsk = useCallback(
     async (question: string) => {
       if (!repoId || isAsking) return;
 
-      // Single backend check if not ready: try once more to confirm
+      // minimal readiness re-check
       if (!isRepoReady) {
         try {
           const res = await fetch(`/api/repos/${repoId}/status`, {
@@ -423,21 +612,23 @@ export default function ChatPage() {
       }
 
       setIsAsking(true);
-
       try {
         const convId = await ensureConversation(repoId);
+        const clientQueryId =
+          (window.crypto as any)?.randomUUID?.() ||
+          `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
         const tempId = `temp-${Date.now()}`;
         const userMsg: ChatMessage = {
           id: tempId,
           role: "user",
           content: question,
+          created_at: new Date().toISOString(),
         };
         setChatHistory((h) => [...h, userMsg]);
         requestAnimationFrame(() => scrollToBottom("smooth"));
 
-        // save question
-        const qRes = await fetch("/api/messages", {
+        await fetch("/api/messages", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -449,9 +640,7 @@ export default function ChatPage() {
             content: question,
           }),
         });
-        const savedQ: ChatMessage = qRes.ok ? await qRes.json() : userMsg;
 
-        // get answer
         const ansRes = await fetch("/api/repos/v2/answer", {
           method: "POST",
           headers: {
@@ -462,29 +651,32 @@ export default function ChatPage() {
             repo_id: repoId,
             query: question,
             conversation_id: convId,
+            user_id: user?.id ?? null,
+            client_query_id: clientQueryId,
           }),
         });
+
         if (!ansRes.ok) {
           const body = await ansRes.text();
           console.error("Answer failed:", ansRes.status, body);
           setChatHistory((h) => [
             ...h.filter((m) => m.id !== tempId),
-            savedQ,
             {
               id: `err-${Date.now()}`,
               role: "assistant",
               content: "(no answer)",
+              created_at: new Date().toISOString(),
             },
           ]);
           requestAnimationFrame(() => scrollToBottom("smooth"));
           return;
         }
+
         const { answer, contexts } = (await ansRes.json()) as {
           answer: string;
           contexts?: ContextItem[];
         };
 
-        // save answer
         const aRes = await fetch("/api/messages", {
           method: "POST",
           headers: {
@@ -497,18 +689,31 @@ export default function ChatPage() {
             content: answer,
           }),
         });
-        const savedAFromServer: ChatMessage = aRes.ok
-          ? await aRes.json()
-          : { id: `a-${Date.now()}`, role: "assistant", content: answer };
+        const savedA = aRes.ok ? await aRes.json() : null;
 
-        const finalAssistant: ChatMessage = {
-          ...savedAFromServer,
+        const assistantMsg: ChatMessage = {
+          id: savedA?.id ? String(savedA.id) : `a-${Date.now()}`,
           role: "assistant",
           content: answer,
+          created_at: savedA?.created_at ?? new Date().toISOString(),
           contexts: contexts ?? [],
         };
 
-        // mark ready after first successful end-to-end answer
+        setChatHistory((h) => [
+          ...h.filter((m) => m.id !== tempId),
+          userMsg,
+          assistantMsg,
+        ]);
+        requestAnimationFrame(() => scrollToBottom("smooth"));
+
+        // persist contexts → right pane “used” counts/snippets update instantly
+        if (assistantMsg.contexts?.length && convId) {
+          const merged = mergeCtxCache(convId, {
+            [assistantMsg.id]: assistantMsg.contexts,
+          });
+          setCtxByMessage(merged);
+        }
+
         setManuallyReady(true);
         setRepoStatus(
           (prev) =>
@@ -520,37 +725,35 @@ export default function ChatPage() {
             }
         );
 
-        setChatHistory((h) => [
-          ...h.filter((m) => m.id !== tempId),
-          savedQ,
-          finalAssistant,
-        ]);
-        requestAnimationFrame(() => scrollToBottom("smooth"));
         setReloadKey((k) => k + 1);
       } catch (e) {
         console.error("Ask error:", e);
       } finally {
         setIsAsking(false);
-        setHistoryRefreshKey((k) => k + 1);
       }
     },
-    [repoId, ensureConversation, isAsking, token, scrollToBottom, isRepoReady]
+    [
+      repoId,
+      isAsking,
+      isRepoReady,
+      ensureConversation,
+      token,
+      user?.id,
+      scrollToBottom,
+    ]
   );
 
-  // sidebar helpers
+  /* UI helpers */
   const onToggleRepo = (rid: string) =>
     setExpanded((prev) => ({ ...prev, [rid]: !prev[rid] }));
-
-  const onSelectConvo = (rid: string, cid: string) => {
+  const onSelectConvo = (_rid: string, cid: string) => {
     setNewRepoMode(false);
     navigate(`/conversation/${cid}`);
   };
-
   const onSelectRepo = (rid: string) => {
     setNewRepoMode(false);
     setRepoId(rid);
   };
-
   const onNewRepo = () => {
     setNewRepoMode(true);
     setRepoId(null);
@@ -558,36 +761,13 @@ export default function ChatPage() {
     setChatHistory([]);
     setRepoStatus(null);
     setManuallyReady(false);
+    setCtxHistory([]);
+    setCtxByMessage({});
+    setPreviewPath(null);
+    setPreviewContent("");
   };
 
-  const onNewChatForRepo = async (rid: string) => {
-    setNewRepoMode(false);
-    try {
-      const res = await fetch("/api/conversations", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({ repo_id: rid }),
-      });
-      if (!res.ok) {
-        toast.error("Failed to create conversation");
-        return;
-      }
-      const data = await res.json().catch(() => ({} as any));
-      const id = data?.id ?? data?.conversation_id ?? data?.conversation?.id;
-      if (id) {
-        setExpanded((p) => ({ ...p, [rid]: true }));
-        setReloadKey((k) => k + 1);
-        navigate(`/conversation/${id}`, { replace: false });
-      }
-    } catch {
-      toast.error("Failed to create conversation");
-    }
-  };
-
-  // Visibility of the UploadForm: show only when we truly need to upload/index.
+  // show/hide upload/index UI
   const showUploadForm = useMemo(() => {
     if (newRepoMode) return true;
     if (!repoId) return true;
@@ -599,119 +779,242 @@ export default function ChatPage() {
     return !terminal;
   }, [newRepoMode, repoId, conversationId, chatHistory, repoStatus]);
 
-  // Only show the "Indexing…" notice when the backend **explicitly** says so.
   const showIndexingNotice = useMemo(() => {
-    if (!repoStatus) return false; // unknown → don't scare the user
+    if (!repoStatus) return false;
     const label = (repoStatus.status || "").toLowerCase();
     const docs = Number(repoStatus.stats?.documents || 0);
     if (docs > 0) return false;
-    return (label === "indexing" || label === "upload") && !isRepoReady;
-  }, [repoStatus, isRepoReady]);
+    return (label === "indexing" || label === "upload") && !isAsking;
+  }, [repoStatus, isAsking]);
 
   const activeConversationId = conversationId;
+
+  const onNewChatForRepo = useCallback(
+    async (rid: string) => {
+      setNewRepoMode(false);
+      try {
+        const res = await fetch("/api/conversations", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({ repo_id: rid }),
+        });
+
+        if (!res.ok) {
+          toast.error("Failed to create conversation");
+          return;
+        }
+
+        const data = await res.json().catch(() => ({} as any));
+        const id = data?.id ?? data?.conversation_id ?? data?.conversation?.id;
+        if (id) {
+          setExpanded((p) => ({ ...p, [rid]: true }));
+          setReloadKey((k) => k + 1);
+          navigate(`/conversation/${id}`, { replace: false });
+        }
+      } catch {
+        toast.error("Failed to create conversation");
+      }
+    },
+    [token, navigate]
+  );
 
   return (
     <>
       <Toaster position="top-right" richColors />
 
-      <div className="h-screen w-full grid grid-cols-[300px_1fr]">
-        {/* sidebar */}
-        <Sidebar
-          convosByRepo={filteredConvosByRepo}
-          expanded={expanded}
-          search={search}
-          activeConversationId={activeConversationId}
-          onSearchChange={setSearch}
-          onToggleRepo={onToggleRepo}
-          onSelectConvo={onSelectConvo}
-          onNewChat={onNewChatForRepo}
-          onNewRepo={onNewRepo}
-          onSelectRepo={onSelectRepo}
-        />
+      {/* 4 columns: [sidebar][chat][handle][right-pane] */}
+      {(() => {
+        const handleWidth = rightOpen ? 6 : 0; // px
+        const paneWidth = rightOpen ? rightWidth : 0; // px
+        return (
+          <div
+            className="h-screen w-full grid"
+            style={{
+              gridTemplateColumns: `300px minmax(0,1fr) ${handleWidth}px ${paneWidth}px`,
+            }}
+          >
+            {/* LEFT: conversations (col 1) */}
+            <Sidebar
+              convosByRepo={filteredConvosByRepo}
+              expanded={expanded}
+              search={search}
+              activeConversationId={activeConversationId}
+              onSearchChange={setSearch}
+              onToggleRepo={onToggleRepo}
+              onSelectConvo={onSelectConvo}
+              onNewChat={onNewChatForRepo}
+              onNewRepo={onNewRepo}
+              onSelectRepo={onSelectRepo}
+            />
 
-        {/* main panel */}
-        <main className="h-screen min-h-0 flex flex-col">
-          <div className="max-w-3xl w-full mx-auto flex-1 min-h-0 flex flex-col">
-            {/* header / setup zone */}
-            <div className="px-4 pt-4">
-              {showUploadForm && (
-                <UploadForm
-                  onRepoId={handleRepoId}
-                  onIndexingComplete={handleIndexed}
-                />
-              )}
-            </div>
+            {/* MIDDLE: chat (col 2) */}
+            <main className="h-screen min-h-0 min-w-0 flex flex-col border-r border-gray-200 dark:border-gray-800">
+              <div className="max-w-3xl w-full mx-auto flex-1 min-h-0 min-w-0 flex flex-col">
+                {/* header / setup zone */}
+                <div className="px-4 pt-4 flex items-center gap-3">
+                  {showUploadForm && (
+                    <UploadForm
+                      onRepoId={handleRepoId}
+                      onIndexingComplete={handleIndexed}
+                    />
+                  )}
 
-            {/* messages scroll area */}
-            <div
-              ref={scrollAreaRef}
-              className="flex-1 min-h-0 overflow-y-auto px-4 pb-24 mt-4"
-            >
-              {repoId && !newRepoMode && (
-                <div className="space-y-3">
-                  {chatHistory.map((msg) => (
-                    <div
-                      key={msg.id}
-                      className={`border rounded p-4 ${
-                        msg.role === "user"
-                          ? "bg-gray-50 dark:bg-gray-900/40"
-                          : ""
-                      }`}
+                  {/* toggle right pane */}
+                  {repoId && (
+                    <button
+                      className="ml-auto text-xs rounded border px-3 py-1.5 bg-white dark:bg-zinc-900 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                      onClick={() => setRightOpen((v) => !v)}
+                      title={rightOpen ? "Hide files" : "Show files"}
                     >
-                      {msg.role === "user" ? (
-                        <p className="font-medium whitespace-pre-wrap">
-                          {msg.content}
-                        </p>
-                      ) : (
-                        <AnswerDisplay
-                          answer={msg.content}
-                          contexts={msg.contexts}
-                        />
-                      )}
-                    </div>
-                  ))}
-
-                  {/* Optional: server-backed history */}
-                  {conversationId && (
-                    <div className="hidden">
-                      <QueryHistory
-                        key={`${conversationId}-${historyRefreshKey}`}
-                        conversationId={conversationId}
-                        newestFirst={false}
-                        refreshKey={historyRefreshKey}
-                      />
-                    </div>
+                      {rightOpen ? "Hide files" : "Show files"}
+                    </button>
                   )}
                 </div>
-              )}
 
-              <div ref={bottomRef} className="h-0" />
-            </div>
+                {/* messages scroll area */}
+                <div
+                  ref={scrollAreaRef}
+                  className="flex-1 min-h-0 overflow-y-auto px-4 pb-24 mt-4"
+                >
+                  {repoId && !newRepoMode && (
+                    <div className="space-y-3">
+                      {chatHistory.map((msg) => (
+                        <div
+                          key={msg.id}
+                          className={`border rounded p-4 ${
+                            msg.role === "user"
+                              ? "bg-gray-50 dark:bg-gray-900/40"
+                              : ""
+                          }`}
+                        >
+                          {msg.role === "user" ? (
+                            <p className="font-medium whitespace-pre-wrap">
+                              {msg.content}
+                            </p>
+                          ) : (
+                            <AnswerDisplay
+                              answer={msg.content}
+                              contexts={msg.contexts}
+                            />
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div ref={bottomRef} className="h-0" />
+                </div>
 
-            {repoId && !newRepoMode && (
-              <div className="sticky bottom-0 w-full border-t bg-white/80 dark:bg-zinc-900/80 backdrop-blur supports-[backdrop-filter]:bg-white/60 px-4 py-3">
-                <div className="max-w-3xl mx-auto">
-                  <QueryForm
-                    key={conversationId || repoId}
-                    repoId={repoId}
-                    onAsk={async (q) => await handleAsk(q)}
-                    onAnswer={() => {}}
-                    onSelectFile={() => {}}
-                    mode="composer"
-                    disabled={!isRepoReady}
-                  />
-                  {showIndexingNotice && (
-                    <p className="text-xs text-gray-500 mt-1">
-                      Indexing… You can browse or upload another repo while this
-                      finishes.
-                    </p>
+                {/* composer */}
+                {repoId && !newRepoMode && (
+                  <div className="sticky bottom-0 w-full border-t bg-white/80 dark:bg-zinc-900/80 backdrop-blur supports-[backdrop-filter]:bg-white/60 px-4 py-3">
+                    <div className="max-w-3xl mx-auto">
+                      {/* @ts-ignore QueryForm may not accept disabled in its typing */}
+                      <QueryForm
+                        key={conversationId || repoId}
+                        repoId={repoId}
+                        onAsk={async (q) => await handleAsk(q)}
+                        onAnswer={() => {}}
+                        onSelectFile={() => {}}
+                        mode="composer"
+                        disabled={!isRepoReady}
+                      />
+                      {showIndexingNotice && (
+                        <p className="text-xs text-gray-500 mt-1">
+                          Indexing… You can browse or upload another repo while
+                          this finishes.
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </main>
+
+            {/* DRAG HANDLE (col 3) */}
+            <div
+              onMouseDown={onDragStart}
+              className="h-screen cursor-col-resize bg-transparent hover:bg-blue-300/40"
+              style={{
+                display: rightOpen ? "block" : "none",
+                // fills the whole column width; grid column width controls size
+                width: "100%",
+              }}
+              // improve target size even when only 6px wide
+              role="separator"
+              aria-orientation="vertical"
+            />
+
+            {/* RIGHT: File tree + preview (col 4) */}
+            <aside
+              className={`h-screen min-h-0 min-w-0 overflow-hidden border-l border-gray-200 dark:border-gray-800 bg-white dark:bg-zinc-900 ${
+                rightOpen ? "opacity-100" : "opacity-0 pointer-events-none"
+              }`}
+            >
+              <div className="h-full grid grid-rows-[auto_minmax(0,1fr)]">
+                {/* File tree */}
+                {repoId ? (
+                  <div className="p-3 border-b dark:border-gray-800">
+                    <FileTree
+                      repoId={repoId}
+                      onSelectFile={handleSelectFile}
+                      usedCounts={usedCounts}
+                      usedSamples={usedSamples}
+                      defaultFilter="used"
+                    />
+                  </div>
+                ) : (
+                  <div className="p-3 text-sm text-gray-500">
+                    No repo selected
+                  </div>
+                )}
+
+                {/* Preview */}
+                <div className="min-h-0 overflow-auto">
+                  {previewPath ? (
+                    <div className="p-3">
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="text-sm font-medium truncate">
+                          {previewPath}
+                        </div>
+                        <div className="flex gap-2">
+                          <button
+                            className="text-xs rounded border px-2 py-1 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                            onClick={() => {
+                              navigator.clipboard.writeText(previewContent);
+                              toast.success("File copied");
+                            }}
+                          >
+                            Copy file
+                          </button>
+                          <button
+                            className="text-xs rounded border px-2 py-1 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                            onClick={() => {
+                              setPreviewPath(null);
+                              setPreviewContent("");
+                            }}
+                          >
+                            Close
+                          </button>
+                        </div>
+                      </div>
+                      <pre className="text-xs whitespace-pre-wrap break-words bg-gray-50 dark:bg-zinc-900 border rounded p-3 max-h-[calc(100vh-230px)] overflow-auto">
+                        {previewContent}
+                      </pre>
+                    </div>
+                  ) : (
+                    <div className="h-full grid place-items-center text-xs text-gray-500">
+                      Select a file to preview
+                    </div>
                   )}
                 </div>
               </div>
-            )}
+            </aside>
           </div>
-        </main>
-      </div>
+        );
+      })()}
     </>
   );
 }
