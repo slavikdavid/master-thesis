@@ -48,7 +48,7 @@ def index_repo(
     repo_path: str,
     repo_id: str,
     batch_size: int = 16,
-    max_chars: int = 5000,
+    max_chars: int = 10000,
     overlap: int = 200,
 ) -> None:
     """

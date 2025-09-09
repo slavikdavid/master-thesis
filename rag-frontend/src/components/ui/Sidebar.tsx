@@ -20,7 +20,9 @@ import {
   AlertDialogFooter,
   AlertDialogCancel,
   AlertDialogAction,
-} from "@/components/ui/alert-dialog";
+} from "../ui/alert-dialog";
+
+import { toast } from "../../lib/toast";
 
 export type Conversation = {
   id: string;
@@ -45,6 +47,10 @@ type SidebarProps = {
   onSelectRepo?: (repoId: string) => void;
 
   onDeleteConvo?: (repoId: string, convoId: string) => Promise<void> | void;
+
+  /** Called after a conversation is successfully deleted so the parent
+   *  can remove it from local state immediately (optimistic UI). */
+  onConvoDeleted?: (repoId: string, convoId: string) => void;
 };
 
 export default function Sidebar({
@@ -59,6 +65,7 @@ export default function Sidebar({
   onNewRepo,
   onSelectRepo,
   onDeleteConvo,
+  onConvoDeleted,
 }: SidebarProps) {
   const repoIds = Object.keys(convosByRepo);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -80,6 +87,17 @@ export default function Sidebar({
           throw new Error(text || `Failed to delete conversation ${convoId}`);
         }
       }
+
+      onConvoDeleted?.(repoId, convoId);
+      window.dispatchEvent(
+        new CustomEvent("conversation:deleted", {
+          detail: { repoId, convoId },
+        })
+      );
+
+      toast.success("Conversation deleted");
+    } catch (err: any) {
+      toast.error(err?.message || "Couldn’t delete conversation");
     } finally {
       setDeletingId(null);
     }

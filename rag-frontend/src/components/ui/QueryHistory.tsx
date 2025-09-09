@@ -3,12 +3,19 @@ import { useEffect, useMemo, useState } from "react";
 import axios from "axios";
 import { useAuth } from "../../context/AuthContext";
 import { AnswerDisplay } from "../ui/AnswerDisplay";
+import { toast } from "sonner";
 
 type Message = {
   id: string;
   role: "user" | "assistant";
   content: string;
-  created_at?: string; // optional; depends on your API
+  created_at?: string;
+};
+
+type ContextMeta = {
+  id?: string | null;
+  filename: string;
+  content: string;
 };
 
 type Props = {
@@ -26,19 +33,45 @@ export function QueryHistory({
 }: Props) {
   const { token } = useAuth();
   const [messages, setMessages] = useState<Message[]>([]);
+  const [contexts, setContexts] = useState<ContextMeta[]>([]);
   const [loading, setLoading] = useState(false);
+  const [deleted, setDeleted] = useState(false);
 
+  // listen for "conversation:deleted" broadcast by Sidebar after a successful delete
+  useEffect(() => {
+    const onDeleted = (e: Event) => {
+      const detail = (e as CustomEvent<{ repoId: string; convoId: string }>)
+        .detail;
+      if (detail?.convoId === conversationId) {
+        setMessages([]);
+        setContexts([]);
+        setDeleted(true);
+        toast.info("This conversation was deleted.");
+      }
+    };
+    window.addEventListener("conversation:deleted", onDeleted as EventListener);
+    return () =>
+      window.removeEventListener(
+        "conversation:deleted",
+        onDeleted as EventListener
+      );
+  }, [conversationId]);
+
+  // fetch messages
   useEffect(() => {
     if (!conversationId) {
       setMessages([]);
+      setContexts([]);
+      setDeleted(false);
       return;
     }
+    if (deleted) return;
 
     const ctrl = new AbortController();
     setLoading(true);
 
     axios
-      .get<Message[]>(`/api/messages`, {
+      .get<Message[]>("/api/messages", {
         params: { conversation_id: conversationId },
         signal: ctrl.signal,
         ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
@@ -49,13 +82,53 @@ export function QueryHistory({
       })
       .catch((err) => {
         if (axios.isCancel(err)) return;
-        console.error("Failed to fetch messages:", err);
-        setMessages([]);
+        const status = err?.response?.status;
+        if (status === 404 || status === 410) {
+          setMessages([]);
+          setContexts([]);
+          setDeleted(true);
+          toast.info("This conversation was deleted.");
+        } else {
+          console.error("Failed to fetch messages:", err);
+          setMessages([]);
+        }
       })
       .finally(() => setLoading(false));
 
     return () => ctrl.abort();
-  }, [conversationId, token, refreshKey]);
+  }, [conversationId, token, refreshKey, deleted]);
+
+  // fetch contexts (server source of truth so they survive F5)
+  useEffect(() => {
+    if (!conversationId || deleted) return;
+
+    const ctrl = new AbortController();
+    axios
+      .get<ContextMeta[]>(
+        `/api/conversations/${encodeURIComponent(conversationId)}/contexts`,
+        {
+          signal: ctrl.signal,
+          ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+        }
+      )
+      .then((res) => {
+        const data = Array.isArray(res.data) ? res.data : [];
+        setContexts(data);
+      })
+      .catch((err) => {
+        if (axios.isCancel(err)) return;
+        const status = err?.response?.status;
+        if (status === 404 || status === 410) {
+          // if contexts endpoint says gone, clear them
+          setContexts([]);
+        } else {
+          console.warn("Failed to fetch contexts:", err);
+          setContexts([]); // be resilient
+        }
+      });
+
+    return () => ctrl.abort();
+  }, [conversationId, token, refreshKey, deleted]);
 
   const ordered = useMemo(() => {
     const sorted = [...messages].sort((a, b) => {
@@ -66,7 +139,15 @@ export function QueryHistory({
     return newestFirst ? sorted.reverse() : sorted;
   }, [messages, newestFirst]);
 
-  // don’t render anything if nothing to show
+  // Determine which message should show the context chips.
+  // Convention: show on the most recent assistant message.
+  const lastAssistantId = useMemo(() => {
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      if (ordered[i].role === "assistant") return ordered[i].id;
+    }
+    return null;
+  }, [ordered]);
+
   if (loading && !ordered.length) return null;
   if (!ordered.length) return null;
 
@@ -82,7 +163,11 @@ export function QueryHistory({
           {msg.role === "user" ? (
             <p className="font-medium">Q: {msg.content}</p>
           ) : (
-            <AnswerDisplay answer={msg.content} />
+            <AnswerDisplay
+              answer={msg.content}
+              // only attach contexts to the latest assistant answer
+              contexts={msg.id === lastAssistantId ? contexts : []}
+            />
           )}
         </div>
       ))}

@@ -1,4 +1,3 @@
-// src/pages/ChatPage.tsx
 import React, {
   useState,
   useEffect,
@@ -8,12 +7,12 @@ import React, {
 } from "react";
 import { Toaster, toast } from "sonner";
 import { UploadForm } from "../components/ui/UploadForm";
-import { QueryForm } from "../components/ui/QueryForm";
 import { AnswerDisplay } from "../components/ui/AnswerDisplay";
 import { useAuth } from "../context/AuthContext";
 import { useNavigate, useParams } from "react-router-dom";
 import { QueryHistory } from "../components/ui/QueryHistory";
 import Sidebar, { Conversation } from "../components/ui/Sidebar";
+import { QueryForm } from "../components/ui/QueryForm";
 
 type ContextItem = {
   id?: string;
@@ -31,11 +30,31 @@ interface ChatMessage {
   contexts?: ContextItem[];
 }
 
-type RepoStatus = {
-  status?: "upload" | "indexing" | "indexed" | "done" | "error" | string;
-  message?: string;
+/** Backend PhaseState (mirror of FastAPI model) */
+type PhaseState = {
+  status?: "queued" | "running" | "complete" | "error" | string;
   processed?: number;
   total?: number;
+  message?: string;
+  error?: string;
+  startedAt?: number;
+  finishedAt?: number;
+};
+
+/** Backend /repos/:id/status response */
+type RepoStatus = {
+  repoId: string;
+  status:
+    | "new"
+    | "upload"
+    | "indexing"
+    | "indexed"
+    | "done"
+    | "error"
+    | "missing"
+    | string;
+  phases: Record<string, PhaseState>;
+  stats?: { documents?: number; [k: string]: any };
 };
 
 const LS_REPO = "lastRepoId";
@@ -82,19 +101,34 @@ export default function ChatPage() {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [search, setSearch] = useState("");
 
-  // repo status to for conditional rendering of upload form
+  // repo status (authoritative, from backend)
   const [repoStatus, setRepoStatus] = useState<RepoStatus | null>(null);
+  // fallback "ready" if we’ve already successfully answered at least once
+  const [manuallyReady, setManuallyReady] = useState(false);
 
   const lastRepoRef = useRef<string | null>(null);
   const restoreDoneRef = useRef(false);
   const [reloadKey, setReloadKey] = useState(0);
 
+  // --- AUTOSCROLL SENTINEL ---
+  const scrollAreaRef = useRef<HTMLDivElement | null>(null);
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
+    if (bottomRef.current) {
+      bottomRef.current.scrollIntoView({ behavior, block: "end" });
+    } else if (scrollAreaRef.current) {
+      const el = scrollAreaRef.current;
+      el.scrollTop = el.scrollHeight;
+    }
+  }, []);
+
+  // keep conversationId in sync with route
   useEffect(() => {
     setConversationId(routeConversationId);
-    if (routeConversationId) setNewRepoMode(false); // leaving new-repo mode when navigating to a convo
+    if (routeConversationId) setNewRepoMode(false);
   }, [routeConversationId]);
 
-  // fetch the conversation to discover repo_id when landing on /conversation/:id
+  // when landing on /conversation/:id, fetch it to learn repo_id
   useEffect(() => {
     if (!routeConversationId) return;
     (async () => {
@@ -115,7 +149,7 @@ export default function ChatPage() {
     })();
   }, [routeConversationId, token]);
 
-  // restore last session only on root route (not when a route param is set)
+  // restore last session only on root route
   useEffect(() => {
     if (restoreDoneRef.current) return;
     restoreDoneRef.current = true;
@@ -135,7 +169,7 @@ export default function ChatPage() {
     if (conversationId) localStorage.setItem(LS_CONV, conversationId);
   }, [conversationId]);
 
-  // -------- fetch ALL conversations; group by repo_id in the UI --------
+  // -------- fetch ALL conversations; group by repo_id --------
   const fetchAllConversations = useCallback(async () => {
     try {
       const res = await fetch("/api/conversations", {
@@ -227,35 +261,40 @@ export default function ChatPage() {
         }
         const msgs: ChatMessage[] = await res.json();
         setChatHistory(Array.isArray(msgs) ? msgs : []);
+        requestAnimationFrame(() => scrollToBottom("auto"));
       } catch (e: any) {
         if (e.name !== "AbortError") console.error("Load messages error:", e);
       }
     })();
     return () => ctrl.abort();
-  }, [conversationId, token]);
+  }, [conversationId, token, scrollToBottom]);
 
-  // -------- fetch repo status --------
+  // -------- SINGLE CHECK: fetch repo status whenever repoId changes ----
   useEffect(() => {
-    if (!repoId) {
-      setRepoStatus(null);
-      return;
-    }
+    setManuallyReady(false); // reset fallback when switching repos
+    setRepoStatus(null);
+    if (!repoId) return;
+
     (async () => {
       try {
         const res = await fetch(`/api/repos/${repoId}/status`, {
           headers: token ? { Authorization: `Bearer ${token}` } : undefined,
         });
-        if (!res.ok) {
-          setRepoStatus(null);
-          return;
-        }
+        if (!res.ok) return;
         const s = (await res.json().catch(() => null)) as RepoStatus | null;
-        setRepoStatus(s);
+        setRepoStatus(s || null);
+
+        // If backend already proves readiness, latch it to avoid UI flip-flop
+        const label = (s?.status || "").toLowerCase();
+        const docs = Number(s?.stats?.documents || 0);
+        if (label === "indexed" || label === "done" || docs > 0) {
+          setManuallyReady(true);
+        }
       } catch {
-        setRepoStatus(null);
+        // keep as null; UI will still allow asking once we get an answer (fallback toggles ready)
       }
     })();
-  }, [repoId, token, reloadKey]);
+  }, [repoId, token]);
 
   // set repo & create a new conversation
   const handleRepoId = useCallback(
@@ -280,7 +319,6 @@ export default function ChatPage() {
           const id =
             data?.id ?? data?.conversation_id ?? data?.conversation?.id ?? null;
           if (id) {
-            // leave new-repo mode once a conversation is made
             setNewRepoMode(false);
             navigate(`/conversation/${id}`, { replace: false });
           }
@@ -298,6 +336,14 @@ export default function ChatPage() {
     (id: string) => {
       toast.success("Repository ready");
       if (!repoId) setRepoId(id);
+      // mark ready immediately (terminal); also set a nonzero documents count
+      setRepoStatus({
+        repoId: id,
+        status: "indexed",
+        phases: {},
+        stats: { documents: 1 },
+      });
+      setManuallyReady(true);
       setReloadKey((k) => k + 1);
     },
     [repoId]
@@ -327,10 +373,55 @@ export default function ChatPage() {
     [conversationId, token, navigate]
   );
 
+  /** Local signal that we already have valid assistant output (helps on F5). */
+  const hasAssistantHistory = useMemo(
+    () => chatHistory.some((m) => m.role === "assistant"),
+    [chatHistory]
+  );
+
+  // compute readiness: backend says indexed/done OR we already answered OR we have docs
+  const isRepoReady = useMemo(() => {
+    const label = (repoStatus?.status || "").toLowerCase();
+    const docs = Number(repoStatus?.stats?.documents || 0);
+    return (
+      manuallyReady ||
+      hasAssistantHistory ||
+      label === "indexed" ||
+      label === "done" ||
+      docs > 0
+    );
+  }, [repoStatus, manuallyReady, hasAssistantHistory]);
+
   // ask flow
   const handleAsk = useCallback(
     async (question: string) => {
       if (!repoId || isAsking) return;
+
+      // Single backend check if not ready: try once more to confirm
+      if (!isRepoReady) {
+        try {
+          const res = await fetch(`/api/repos/${repoId}/status`, {
+            headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+          });
+          if (res.ok) {
+            const s = (await res.json().catch(() => null)) as RepoStatus | null;
+            setRepoStatus(s || null);
+            const label = (s?.status || "").toLowerCase();
+            const docs = Number(s?.stats?.documents || 0);
+            if (!(label === "indexed" || label === "done" || docs > 0)) {
+              toast.error("Repository is not indexed yet.");
+              return;
+            }
+          } else {
+            toast.error("Repository is not ready yet.");
+            return;
+          }
+        } catch {
+          toast.error("Repository is not ready yet.");
+          return;
+        }
+      }
+
       setIsAsking(true);
 
       try {
@@ -343,6 +434,7 @@ export default function ChatPage() {
           content: question,
         };
         setChatHistory((h) => [...h, userMsg]);
+        requestAnimationFrame(() => scrollToBottom("smooth"));
 
         // save question
         const qRes = await fetch("/api/messages", {
@@ -366,7 +458,11 @@ export default function ChatPage() {
             "Content-Type": "application/json",
             ...(token ? { Authorization: `Bearer ${token}` } : {}),
           },
-          body: JSON.stringify({ repo_id: repoId, query: question }),
+          body: JSON.stringify({
+            repo_id: repoId,
+            query: question,
+            conversation_id: convId,
+          }),
         });
         if (!ansRes.ok) {
           const body = await ansRes.text();
@@ -380,6 +476,7 @@ export default function ChatPage() {
               content: "(no answer)",
             },
           ]);
+          requestAnimationFrame(() => scrollToBottom("smooth"));
           return;
         }
         const { answer, contexts } = (await ansRes.json()) as {
@@ -411,11 +508,24 @@ export default function ChatPage() {
           contexts: contexts ?? [],
         };
 
+        // mark ready after first successful end-to-end answer
+        setManuallyReady(true);
+        setRepoStatus(
+          (prev) =>
+            prev ?? {
+              repoId: repoId,
+              status: "indexed",
+              phases: {},
+              stats: { documents: 1 },
+            }
+        );
+
         setChatHistory((h) => [
           ...h.filter((m) => m.id !== tempId),
           savedQ,
           finalAssistant,
         ]);
+        requestAnimationFrame(() => scrollToBottom("smooth"));
         setReloadKey((k) => k + 1);
       } catch (e) {
         console.error("Ask error:", e);
@@ -424,7 +534,7 @@ export default function ChatPage() {
         setHistoryRefreshKey((k) => k + 1);
       }
     },
-    [repoId, ensureConversation, isAsking, token]
+    [repoId, ensureConversation, isAsking, token, scrollToBottom, isRepoReady]
   );
 
   // sidebar helpers
@@ -442,11 +552,12 @@ export default function ChatPage() {
   };
 
   const onNewRepo = () => {
-    // enter "new repo" mode: clear current selection and show ONLY uploadform
     setNewRepoMode(true);
     setRepoId(null);
     setConversationId(null);
     setChatHistory([]);
+    setRepoStatus(null);
+    setManuallyReady(false);
   };
 
   const onNewChatForRepo = async (rid: string) => {
@@ -476,15 +587,26 @@ export default function ChatPage() {
     }
   };
 
-  // conditionally render upload form
+  // Visibility of the UploadForm: show only when we truly need to upload/index.
   const showUploadForm = useMemo(() => {
-    if (newRepoMode) return true; // <- force upload form only in this mode
+    if (newRepoMode) return true;
     if (!repoId) return true;
-    const s = (repoStatus?.status || "").toLowerCase();
-    if (s && s !== "indexed" && s !== "done") return true;
-    if (chatHistory.length === 0) return true;
-    return false;
-  }, [newRepoMode, repoId, repoStatus, chatHistory.length]);
+    if (conversationId || (chatHistory && chatHistory.length > 0)) return false;
+    const label = (repoStatus?.status || "").toLowerCase();
+    const docs = Number(repoStatus?.stats?.documents || 0);
+    const terminal =
+      label === "indexed" || label === "done" || label === "error" || docs > 0;
+    return !terminal;
+  }, [newRepoMode, repoId, conversationId, chatHistory, repoStatus]);
+
+  // Only show the "Indexing…" notice when the backend **explicitly** says so.
+  const showIndexingNotice = useMemo(() => {
+    if (!repoStatus) return false; // unknown → don't scare the user
+    const label = (repoStatus.status || "").toLowerCase();
+    const docs = Number(repoStatus.stats?.documents || 0);
+    if (docs > 0) return false;
+    return (label === "indexing" || label === "upload") && !isRepoReady;
+  }, [repoStatus, isRepoReady]);
 
   const activeConversationId = conversationId;
 
@@ -508,65 +630,84 @@ export default function ChatPage() {
         />
 
         {/* main panel */}
-        <main className="min-h-0 overflow-auto">
-          <div className="max-w-3xl mx-auto p-4 space-y-6">
-            {showUploadForm && (
-              <UploadForm
-                onRepoId={handleRepoId}
-                onIndexingComplete={handleIndexed}
-              />
-            )}
-
-            {/* hide chat UI entirely while in newRepoMode */}
-            {repoId && !newRepoMode && (
-              <>
-                <QueryForm
-                  key={conversationId || repoId}
-                  repoId={repoId}
-                  onAsk={async (q) => await handleAsk(q)}
-                  onAnswer={() => {}}
-                  onSelectFile={() => {}}
+        <main className="h-screen min-h-0 flex flex-col">
+          <div className="max-w-3xl w-full mx-auto flex-1 min-h-0 flex flex-col">
+            {/* header / setup zone */}
+            <div className="px-4 pt-4">
+              {showUploadForm && (
+                <UploadForm
+                  onRepoId={handleRepoId}
+                  onIndexingComplete={handleIndexed}
                 />
+              )}
+            </div>
 
-                <div className="space-y-4 mt-6">
-                  <h2 className="text-lg font-semibold">Chat</h2>
+            {/* messages scroll area */}
+            <div
+              ref={scrollAreaRef}
+              className="flex-1 min-h-0 overflow-y-auto px-4 pb-24 mt-4"
+            >
+              {repoId && !newRepoMode && (
+                <div className="space-y-3">
+                  {chatHistory.map((msg) => (
+                    <div
+                      key={msg.id}
+                      className={`border rounded p-4 ${
+                        msg.role === "user"
+                          ? "bg-gray-50 dark:bg-gray-900/40"
+                          : ""
+                      }`}
+                    >
+                      {msg.role === "user" ? (
+                        <p className="font-medium whitespace-pre-wrap">
+                          {msg.content}
+                        </p>
+                      ) : (
+                        <AnswerDisplay
+                          answer={msg.content}
+                          contexts={msg.contexts}
+                        />
+                      )}
+                    </div>
+                  ))}
 
-                  {/* primary: server-backed history */}
+                  {/* Optional: server-backed history */}
                   {conversationId && (
-                    <QueryHistory
-                      key={`${conversationId}-${historyRefreshKey}`}
-                      conversationId={conversationId}
-                      newestFirst={false}
-                      refreshKey={historyRefreshKey}
-                    />
-                  )}
-
-                  {/* fallback if server history fails/empty */}
-                  {(!conversationId || chatHistory.length > 0) && (
-                    <>
-                      {chatHistory.map((msg) => (
-                        <div
-                          key={msg.id}
-                          className={`border rounded p-4 ${
-                            msg.role === "user"
-                              ? "bg-gray-50 dark:bg-gray-900/40"
-                              : ""
-                          }`}
-                        >
-                          {msg.role === "user" ? (
-                            <p className="font-medium">Q: {msg.content}</p>
-                          ) : (
-                            <AnswerDisplay
-                              answer={msg.content}
-                              contexts={msg.contexts}
-                            />
-                          )}
-                        </div>
-                      ))}
-                    </>
+                    <div className="hidden">
+                      <QueryHistory
+                        key={`${conversationId}-${historyRefreshKey}`}
+                        conversationId={conversationId}
+                        newestFirst={false}
+                        refreshKey={historyRefreshKey}
+                      />
+                    </div>
                   )}
                 </div>
-              </>
+              )}
+
+              <div ref={bottomRef} className="h-0" />
+            </div>
+
+            {repoId && !newRepoMode && (
+              <div className="sticky bottom-0 w-full border-t bg-white/80 dark:bg-zinc-900/80 backdrop-blur supports-[backdrop-filter]:bg-white/60 px-4 py-3">
+                <div className="max-w-3xl mx-auto">
+                  <QueryForm
+                    key={conversationId || repoId}
+                    repoId={repoId}
+                    onAsk={async (q) => await handleAsk(q)}
+                    onAnswer={() => {}}
+                    onSelectFile={() => {}}
+                    mode="composer"
+                    disabled={!isRepoReady}
+                  />
+                  {showIndexingNotice && (
+                    <p className="text-xs text-gray-500 mt-1">
+                      Indexing… You can browse or upload another repo while this
+                      finishes.
+                    </p>
+                  )}
+                </div>
+              </div>
             )}
           </div>
         </main>

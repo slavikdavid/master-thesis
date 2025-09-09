@@ -105,7 +105,7 @@ def load_code_chunks(repo_id: str) -> List[Document]:
     return docs
 
 
-def index_repo(repo_id: str, *, batch_size: int = 16, max_chars: int = 5000, overlap: int = 200) -> Dict[str, Any]:
+def index_repo(repo_id: str, *, batch_size: int = 16, max_chars: int = 10000, overlap: int = 200) -> Dict[str, Any]:
     """
     Thin wrapper to kick off the real async/threaded indexing pipeline.
     Returns immediately; progress is reported via the WebSocket broker.

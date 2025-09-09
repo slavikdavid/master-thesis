@@ -111,7 +111,7 @@ def _byte_to_line(idx: int, starts: List[int]) -> int:
 def chunk_code(
     path: str,
     text: str,
-    max_chars: int = 5000,
+    max_chars: int = 10000,
     overlap: int = 200
 ) -> List[Dict[str, Any]]:
     """
