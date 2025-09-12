@@ -64,7 +64,6 @@ def index_repo(
       - {"phase":"error","message":"..."} on fatal failure
     """
 
-    # -------- 1) gather chunks (skip hidden files/dirs) --------
     all_chunks: List[Dict[str, Any]] = []
     for rel_path in list_files(repo_id):
         if _is_hidden_path(rel_path):
@@ -75,7 +74,6 @@ def index_repo(
             with open(abs_path, "r", encoding="utf-8") as f:
                 text = f.read()
         except Exception:
-            # non-text/binary or unreadable file
             continue
 
         for raw in chunk_code(rel_path, text, max_chars=max_chars, overlap=overlap):
@@ -95,7 +93,6 @@ def index_repo(
 
     total_chunks = len(all_chunks)
 
-    # nothing to index → emit completion signals & return
     if total_chunks == 0:
         _broadcast(repo_id, {
             "phase": "embedding",
@@ -114,7 +111,6 @@ def index_repo(
         _broadcast(repo_id, {"phase": "indexed", "progress": 100})
         return
 
-    # initial phase announcements
     _broadcast(repo_id, {
         "phase": "embedding",
         "event": "start",
@@ -130,30 +126,24 @@ def index_repo(
         "progress": 0,
     })
 
-    # -------- 2) Prepare embedder --------
     embedder = VoyageDocumentEmbedder(
         model=VOYAGE_MODEL,
-        input_type="document",  # document mode for corpus chunks
-        # VOYAGE_API_KEY is read from environment automatically
+        input_type="document",
     )
     try:
         embedder.warm_up()
     except Exception:
         pass
 
-    # allow future pause/resume if needed
     ready = Event()
     ready.set()
 
-    # lazily create the vector store once embedding dimension is known
     store: Optional[PgvectorDocumentStore] = None
 
-    # track filenames already announced to avoid duplicate file_indexed events
     sent_files: Set[str] = set()
 
-    # embedding and indexing progress bars
-    embed_done = 0   # chunks embedded
-    index_done = 0   # chunks written
+    embed_done = 0
+    index_done = 0
     last_emb_pct: Optional[int] = None
     last_idx_pct: Optional[int] = None
 
@@ -164,7 +154,6 @@ def index_repo(
             for start in range(0, total_chunks, batch_size):
                 batch = all_chunks[start : start + batch_size]
 
-                # build documents (preserve filename + line metadata)
                 docs: List[Document] = []
                 for idx, item in enumerate(batch):
                     content = _chunk_text(item.get("content"))
@@ -173,7 +162,6 @@ def index_repo(
                     rel_path = item["filename"]
                     s_line = item.get("start_line")
                     e_line = item.get("end_line")
-                    # include a line range (or stable index) to keep chunks distinct
                     suffix = (
                         f"{s_line}-{e_line}"
                         if isinstance(s_line, int) and isinstance(e_line, int)
@@ -197,10 +185,8 @@ def index_repo(
 
                 ready.wait()
 
-                # —— embedding ——
                 embedded_docs = embedder.run(docs)["documents"]
 
-                # update embedding progress (only emit when percentage changes)
                 embed_done += len(embedded_docs)
                 emb_pct = int(embed_done * 100 / max(1, total_chunks))
                 if emb_pct != last_emb_pct:
@@ -213,7 +199,6 @@ def index_repo(
                         "progress": emb_pct,
                     })
 
-                # lazily initialize the vector store once dimension is known
                 if store is None:
                     first_emb = next(
                         (d.embedding for d in embedded_docs if getattr(d, "embedding", None)),
@@ -234,10 +219,8 @@ def index_repo(
                         hnsw_ef_search=50,
                     )
 
-                # —— write to vector store ——
                 store.write_documents(embedded_docs, policy=DuplicatePolicy.OVERWRITE)
 
-                # per-file event (only once per filename)
                 just_indexed: List[str] = []
                 for d in embedded_docs:
                     meta = getattr(d, "meta", {}) or {}
@@ -253,7 +236,6 @@ def index_repo(
                         "path": rel,
                     })
 
-                # indexing progress (emit when percentage changes)
                 index_done += len(embedded_docs)
                 idx_pct = int(index_done * 100 / max(1, total_chunks))
                 if idx_pct != last_idx_pct:
@@ -266,7 +248,6 @@ def index_repo(
                         "progress": idx_pct,
                     })
 
-            # completed
             _broadcast(repo_id, {
                 "phase": "embedding",
                 "event": "complete",
@@ -285,7 +266,6 @@ def index_repo(
 
         except Exception as e:
             logger.exception("Indexing failed for repo_id=%s", repo_id)
-            # mark both phases errored so UI can reflect failure
             _broadcast(repo_id, {"phase": "embedding", "event": "error", "error": str(e)})
             _broadcast(repo_id, {"phase": "indexing", "event": "error", "error": str(e)})
             _broadcast(repo_id, {"phase": "error", "message": str(e)})

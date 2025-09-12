@@ -251,7 +251,6 @@ async def get_context_history(item_id: Any) -> List[Dict[str, Any]]:
 
   out: List[Dict[str, Any]] = []
   for rq in rqs or []:
-    # map rag_query to the *next* assistant message in time (if any)
     msg = await fetch_one(
       """
       SELECT id
@@ -299,8 +298,6 @@ async def get_context_history(item_id: Any) -> List[Dict[str, Any]]:
       }
     )
   return out
-
-# ---------- Summary (per-file usage) ----------
 
 @router.get("/{item_id}/contexts/summary")
 async def get_context_summary(item_id: Any):

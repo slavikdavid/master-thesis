@@ -5,7 +5,6 @@ from psycopg.rows import dict_row
 
 DATABASE_URL = os.getenv("DATABASE_DSN")
 
-# async connection pool
 pool: psycopg.AsyncConnection = None
 
 async def connect_db():

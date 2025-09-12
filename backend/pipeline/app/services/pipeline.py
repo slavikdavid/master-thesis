@@ -25,7 +25,7 @@ from haystack_integrations.components.embedders.voyage_embedders import VoyageTe
 try:
     from haystack_integrations.components.rankers.voyage import VoyageRanker
 except ImportError:
-    from haystack_integrations.components.rankers.voyage.ranker import VoyageRanker  # type: ignore
+    from haystack_integrations.components.rankers.voyage.ranker import VoyageRanker
 
 from app.utils import get_document_store
 from app.db import fetch_one, execute  # NOTE: we use fetch_one for RETURNING
@@ -38,9 +38,6 @@ VOYAGE_MODEL = os.getenv("VOYAGE_MODEL", "voyage-code-2")
 VOYAGE_RERANKER_MODEL = os.getenv("VOYAGE_RERANKER_MODEL", "rerank-2.5-lite")
 
 
-# ------------------------
-# Utilities
-# ------------------------
 def _rewrite_doc_numbers_to_filenames(answer: str, file_order: List[str]) -> str:
     """Turn 'Document N' into `filename` if the model slips."""
     def repl(m):
@@ -131,7 +128,7 @@ def _render_history_md(turns: List[Dict], max_total_chars: int = 2400) -> str:
     if not turns:
         return ""
     buf, used = [], 0
-    for t in reversed(turns):  # oldest to newest
+    for t in reversed(turns):
         q = _compact(t.get("query_text", ""), 700)
         a = _compact(t.get("response_text", ""), 1000)
         chunk = f"- **User earlier**: {q}\n  **Assistant earlier**: {a}"
@@ -147,15 +144,12 @@ def _history_hint(turns: List[Dict], max_len: int = 240) -> str:
     """A short hint derived from the latest user query to steer retrieval."""
     if not turns:
         return ""
-    latest = turns[0]  # newest-first from _load_recent_history
+    latest = turns[0]
     hint = latest.get("query_text", "") or ""
     hint = _re.sub(r"\s+", " ", hint).strip()
     return hint[:max_len]
 
 
-# ------------------------
-# Main entry
-# ------------------------
 async def query_codebase(
     request: QueryRequest,
     filters: Optional[Dict] = None,
@@ -166,7 +160,6 @@ async def query_codebase(
 
     contexts = [{ id, filename, content, start_line?, end_line? }]
     """
-    # 1) embedder
     text_embedder = VoyageTextEmbedder(
         model=VOYAGE_MODEL,
         input_type="query",
@@ -176,10 +169,8 @@ async def query_codebase(
     except Exception:
         pass
 
-    # 2) document store
     store = get_document_store()
 
-    # 3) retriever + ranker
     retriever = PgvectorEmbeddingRetriever(document_store=store, top_k=10)
     ranker = VoyageRanker(model=VOYAGE_RERANKER_MODEL)
 
@@ -190,12 +181,10 @@ async def query_codebase(
     pipe.connect("embedder.embedding", "retriever.query_embedding")
     pipe.connect("retriever.documents", "ranker.documents")
 
-    # ---- Conversation history (for both chat and retrieval) ----
     recent_turns = await _load_recent_history(getattr(request, "conversationId", None), limit=6)
     history_md = _render_history_md(recent_turns)
     hint = _history_hint(recent_turns)
 
-    # 4) Retrieval (make it history-aware)
     retriever_query = request.question
     if hint:
         retriever_query = f"{request.question}\n\n(History hint: {hint})"
@@ -220,7 +209,6 @@ async def query_codebase(
     else:
         print(f"[debug] Retrieved {len(retrieved)} docs from embeddings table")
 
-    # Build UI contexts (dedupe by first chunk per file)
     contexts: List[Dict] = []
     seen_files = set()
     for d in retrieved:
@@ -237,7 +225,6 @@ async def query_codebase(
         })
         seen_files.add(fname)
 
-    # Group excerpts by file for the prompt
     warning = ""
     if not retrieved:
         warning = "Warning: no docs matched repo_id; answering without context.\n\n"
@@ -262,7 +249,6 @@ async def query_codebase(
             body = body[:2500]
         grouped_files.append((fname, body))
 
-    # 5) Build messages for the chat model (true chat: system + history + current)
     system_rules = (
         "You are a coding RAG assistant.\n"
         "- Cite sources by filename + line ranges only (e.g., `src/utils.py` lines 120–180).\n"
@@ -273,25 +259,24 @@ async def query_codebase(
         "- Answer concisely first, then offer one short, relevant follow-up help question."
     )
 
-    # Current context + question in a single user message
     current_user_tpl = Template(
         """{{ warning }}You are assisting with the repository: `{{ repo_id }}`.
 
 {% if history_md -%}
-🗂️ Earlier conversation (most recent last). Use only if relevant:
+Earlier conversation (most recent last). Use only if relevant:
 {{ history_md }}
 
 {%- endif %}
-📂 Context (grouped by file):
+Context (grouped by file):
 {% for fname, body in grouped_files -%}
 FILE: {{ fname }}
 {{ body }}
 
 {% endfor -%}
 
-❓ Question: {{ question }}
+Question: {{ question }}
 
-💡 Respond with citations (filename + line ranges only)."""
+Respond with citations (filename + line ranges only)."""
     )
     current_user_payload = current_user_tpl.render(
         warning=warning,
@@ -304,16 +289,13 @@ FILE: {{ fname }}
     messages: List[ChatMessage] = []
     messages.append(ChatMessage.from_system(system_rules))
 
-    # Add prior turns as literal chat messages (oldest → newest), compacted
     if recent_turns:
         for t in reversed(recent_turns):
             messages.append(ChatMessage.from_user(_compact(t.get("query_text", ""), 1000)))
             messages.append(ChatMessage.from_assistant(_compact(t.get("response_text", ""), 1400)))
 
-    # Current turn
     messages.append(ChatMessage.from_user(current_user_payload))
 
-    # 6) LLM call with streaming
     groq_key = os.getenv("GROQ_API_KEY")
     if not groq_key:
         raise RuntimeError("GROQ_API_KEY not set")
@@ -350,7 +332,6 @@ FILE: {{ fname }}
 
     answer = _rewrite_doc_numbers_to_filenames(answer, file_order)
 
-    # 7) Persist JSON history on disk (unchanged)
     repo_dir = Path("data") / "repos" / request.repoId
     repo_dir.mkdir(parents=True, exist_ok=True)
     hist_file = repo_dir / "queries.json"
@@ -362,11 +343,9 @@ FILE: {{ fname }}
     })
     hist_file.write_text(json.dumps(history, indent=2), encoding="utf-8")
 
-    # 8) DB persistence: rag_queries + retrieved_chunks
     try:
         print(f"[dbg] conversationId={getattr(request, 'conversationId', None)} userId={getattr(request, 'userId', None)} repoId={request.repoId}")
 
-        # Conversation handling
         conv_ok = False
         conv_id_param: Optional[str] = None
         conv_user_id: Optional[str] = None
@@ -384,10 +363,8 @@ FILE: {{ fname }}
         if not conv_ok and getattr(request, "conversationId", None):
             print(f"[warn] conversationId {request.conversationId} not found; inserting rag_query with NULL conversation_id")
 
-        # Choose user_id: explicit from request, else from conversation row (if any)
         user_id_param: Optional[str] = getattr(request, "userId", None) or conv_user_id
 
-        # response metadata (cast to jsonb explicitly)
         meta_obj = {
             "repo_id": request.repoId,
             "ranker_model": VOYAGE_RERANKER_MODEL,
@@ -395,7 +372,6 @@ FILE: {{ fname }}
         }
         meta_json = json.dumps(meta_obj)
 
-        # IMPORTANT: use fetch_one for INSERT ... RETURNING
         rq = await fetch_one(
             """
             INSERT INTO rag_queries (conversation_id, user_id, query_text, response_text, response_metadata)
@@ -416,7 +392,6 @@ FILE: {{ fname }}
 
         rag_query_id = rq["id"]
 
-        # retrieved_chunks (best-effort)
         try:
             rank_counter = 1
             for d in retrieved:

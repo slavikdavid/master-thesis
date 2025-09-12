@@ -15,8 +15,6 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer_scheme = HTTPBearer()
 
-# request / response schemas
-
 class SignupRequest(BaseModel):
     email: EmailStr
     password: str
@@ -39,8 +37,6 @@ class UserProfile(BaseModel):
     is_active: bool
     is_email_verified: bool
 
-# helpers
-
 def create_access_token(user_id: str) -> str:
     now = datetime.utcnow()
     exp = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -59,8 +55,6 @@ def get_current_user_token(
         return user_id
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid auth token")
-
-# routes
 
 @router.post("/signup", response_model=TokenResponse)
 async def signup(req: SignupRequest):
@@ -82,7 +76,6 @@ async def signup(req: SignupRequest):
     )
     user_id = row["id"]
 
-    # create personal team
     await execute(
         """
         INSERT INTO teams (name, owner_user_id)
@@ -126,7 +119,6 @@ async def me(user_id: str = Depends(get_current_user_token)):
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # convert the UUID to string before validation
     data = dict(row)
     data["id"] = str(data["id"])
 

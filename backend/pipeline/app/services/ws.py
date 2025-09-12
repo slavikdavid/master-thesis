@@ -11,16 +11,11 @@ from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 
 BASE = Path(os.getenv("DATA_DIR", "data/repos"))
 
-# repo_id -> list[WebSocket] currently watching that repo
 _watchers: Dict[str, List[WebSocket]] = {}
 
-# reference to the server's main asyncio loop (for thread-safe broadcasts)
 _server_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
-# ---------------------------
-# loop + watcher management
-# ---------------------------
 def set_main_loop(loop: asyncio.AbstractEventLoop) -> None:
     """Record the main server loop so background threads can schedule coroutines."""
     global _server_loop
@@ -35,7 +30,6 @@ def register_watcher(repo_id: str, ws: WebSocket) -> None:
         if loop and loop.is_running():
             _server_loop = loop
     except RuntimeError:
-        # no running loop (called from a worker thread) — ignore
         pass
     _watchers.setdefault(repo_id, []).append(ws)
 
@@ -63,9 +57,6 @@ async def _try_send_json(ws: WebSocket, payload: dict) -> bool:
         return False
 
 
-# ---------------------------
-# broadcasting helpers
-# ---------------------------
 async def _send_to_all(repo_id: str, payload: dict) -> None:
     """Coroutine: send to all watchers of repo_id and prune dead ones."""
     watchers = list(_watchers.get(repo_id, []))
@@ -83,7 +74,6 @@ def broadcast(repo_id: str, payload: dict) -> None:
     Thread-safe broadcast of an arbitrary payload to all watchers of repo_id.
     Safe to call from worker threads.
     """
-    # schedule directly
     try:
         loop = asyncio.get_running_loop()
         if loop.is_running():
@@ -92,7 +82,6 @@ def broadcast(repo_id: str, payload: dict) -> None:
     except RuntimeError:
         pass
 
-    # otherwise schedule onto the captured server loop
     if _server_loop and _server_loop.is_running():
         asyncio.run_coroutine_threadsafe(_send_to_all(repo_id, payload), _server_loop)
     else:
@@ -127,10 +116,6 @@ def broadcast_progress(
 
 _broadcast = broadcast_progress
 
-
-# ---------------------------
-# stream function used by routes
-# ---------------------------
 async def stream_repo(ws: WebSocket, repo_id: str, keepalive_secs: float = 25.0) -> None:
     """
     Register the socket as a watcher and keep the connection open.
@@ -140,10 +125,8 @@ async def stream_repo(ws: WebSocket, repo_id: str, keepalive_secs: float = 25.0)
     register_watcher(repo_id, ws)
 
     try:
-        # send an initial no-op so the client knows the stream is alive
         await _try_send_json(ws, {"event": "connected", "repoId": repo_id})
 
-        # keepalive loop; clients ignore frames that lack a `phase`
         while True:
             try:
                 await asyncio.sleep(keepalive_secs)
@@ -153,7 +136,6 @@ async def stream_repo(ws: WebSocket, repo_id: str, keepalive_secs: float = 25.0)
             except (WebSocketDisconnect, ConnectionClosedOK, ConnectionClosedError):
                 break
             except Exception:
-                # swallow and continue; next tick will try again
                 pass
     finally:
         unregister_watcher(repo_id, ws)

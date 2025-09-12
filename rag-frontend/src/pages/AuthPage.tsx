@@ -76,9 +76,12 @@ export default function AuthPage() {
   };
 
   return (
-    <div className="flex items-center justify-center min-h-screen bg-gray-50 p-4">
+    <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50 p-4 space-y-6">
+      <h1 className="text-3xl font-semibold text-center">
+        byte
+        <span className="tracking-tight font-bold text-indigo-600">sophos</span>
+      </h1>
       <div className="space-x-4">
-        {/* login Modal */}
         <Dialog open={isLoginOpen} onOpenChange={setIsLoginOpen}>
           <DialogTrigger asChild>
             <Button>Login</Button>

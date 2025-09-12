@@ -11,8 +11,8 @@ class ProgressBroker:
     async def update(
         self,
         repo_id: str,
-        phase: str,            # "upload" | "embedding" | "indexing"
-        status: str,           # "queued" | "running" | "complete" | "error"
+        phase: str,
+        status: str,
         processed: Optional[int] = None,
         total: Optional[int] = None,
         message: Optional[str] = None,
@@ -72,7 +72,6 @@ class InMemoryProgressBroker(ProgressBroker):
             if message is not None: cur["message"] = message
             if error is not None: cur["error"] = error
             if status in ("complete", "error"): cur["finishedAt"] = time.time()
-            # compute processed %
             p = cur.get("processed"); t = cur.get("total")
             if isinstance(p, int) and isinstance(t, int) and t > 0:
                 cur["progress"] = max(0, min(100, int(p * 100 / t)))
@@ -80,7 +79,6 @@ class InMemoryProgressBroker(ProgressBroker):
 
             snap.update(self._overall(phases))
 
-            # notify subs
             payload = {
                 "type": "task_update",
                 "repoId": repo_id,
@@ -106,7 +104,6 @@ class InMemoryProgressBroker(ProgressBroker):
         q: asyncio.Queue = asyncio.Queue(maxsize=100)
         async with self._lock:
             self._subs.setdefault(repo_id, set()).add(q)
-            # yield current snapshot
             yield await self.snapshot(repo_id)
         try:
             while True:
@@ -115,5 +112,4 @@ class InMemoryProgressBroker(ProgressBroker):
             async with self._lock:
                 self._subs.get(repo_id, set()).discard(q)
 
-# choose backend
 BROKER: ProgressBroker = InMemoryProgressBroker()

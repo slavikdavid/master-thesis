@@ -24,7 +24,6 @@ GITHUB_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# map GitPython op codes to readable strings
 _OP_NAME = {
     RemoteProgress.COUNTING:    "Counting objects",
     RemoteProgress.COMPRESSING: "Compressing objects",
@@ -47,7 +46,6 @@ def _emit_phase(repo_id: str, phase: str, *, status: str, progress: Optional[int
     """
     payload = {"phase": phase, "status": status}
     if progress is not None:
-        # clamp and int
         payload["progress"] = max(0, min(100, int(progress)))
     payload.update(extra)
     _broadcast(repo_id, payload)
@@ -66,14 +64,12 @@ class GitCloneProgress(RemoteProgress):
         if op_code & self.BEGIN:
             _emit_phase(self.repo_id, "upload", status="running", progress=0, message=f"Starting {op_name}", kind="github")
 
-        # known total → compute percentage
         if max_count:
             pct = int(cur_count / max_count * 100) if max_count else None
             if pct is not None and pct != self._last_pct:
                 self._last_pct = pct
                 _emit_phase(self.repo_id, "upload", status="running", progress=pct, message=f"{op_name} ({pct}%)", kind="github")
         else:
-            # unknown total → still keep it 'running'; no numeric progress
             if message:
                 _emit_phase(self.repo_id, "upload", status="running", message=message, kind="github")
 
@@ -94,11 +90,9 @@ async def handle_github_clone(repo_url: str, repo_id: str) -> None:
     dest = os.path.join(UPLOAD_DIR, repo_id)
     os.makedirs(dest, exist_ok=True)
 
-    # initialize other phases in 'queued' so the UI can render them from the start
     _emit_phase(repo_id, "embedding", status="queued", progress=0)
     _emit_phase(repo_id, "indexing", status="queued", progress=0)
 
-    # start git clone upload phase
     _emit_phase(repo_id, "upload", status="running", progress=0, message="Starting Git clone", kind="github")
 
     try:
@@ -114,10 +108,8 @@ async def handle_github_clone(repo_url: str, repo_id: str) -> None:
 
         await asyncio.to_thread(do_clone)
 
-        # clone complete
         _emit_phase(repo_id, "upload", status="complete", progress=100, message="Git clone complete, starting indexing", kind="github")
 
-        # kick off indexing (emit 'embedding' + 'indexing' updates)
         index_repo(dest, repo_id)
 
     except GitCommandError as e:
@@ -144,11 +136,9 @@ async def handle_zip_upload(file: UploadFile, repo_id: str) -> None:
     zip_path = os.path.join(dest, filename)
     tmp_path = zip_path + ".part"
 
-    # initialize other phases so UI can show them immediately
     _emit_phase(repo_id, "embedding", status="queued", progress=0)
     _emit_phase(repo_id, "indexing", status="queued", progress=0)
 
-    # try to get the part's total size from multipart headers 
     bytes_total: Optional[int] = None
     try:
         hdr_val = file.headers.get("content-length") if hasattr(file, "headers") and file.headers else None
@@ -169,7 +159,6 @@ async def handle_zip_upload(file: UploadFile, repo_id: str) -> None:
     )
 
     try:
-        # ----- write the incoming file to disk -----
         written = 0
         chunk_size = 1024 * 1024
 
@@ -189,18 +178,16 @@ async def handle_zip_upload(file: UploadFile, repo_id: str) -> None:
                     repo_id,
                     "upload",
                     status="running",
-                    progress=pct,  # may be None if total unknown
+                    progress=pct, 
                     message=f"Uploading ZIP ({written // 1024} KB)",
                     kind="zip",
                     bytes_total=bytes_total,
                     bytes_written=written,
                 )
 
-        # atomically move temp → final
         try:
             os.replace(tmp_path, zip_path)
         except Exception:
-            # if replace fails, fallback to rename/copy
             try:
                 if os.path.exists(zip_path):
                     os.remove(zip_path)
@@ -219,13 +206,11 @@ async def handle_zip_upload(file: UploadFile, repo_id: str) -> None:
             bytes_written=written,
         )
 
-        # ----- extract safely (avoid zip slip vulnerability) -----
         _emit_phase(repo_id, "upload", status="running", message="Extracting ZIP", kind="zip")
 
         dest_real = os.path.realpath(dest)
         with zipfile.ZipFile(zip_path) as z:
             for info in z.infolist():
-                # prevent path traversal
                 extract_to = os.path.realpath(os.path.join(dest, info.filename))
                 if not extract_to.startswith(dest_real + os.sep) and extract_to != dest_real:
                     raise ValueError(f"Unsafe path in ZIP: {info.filename}")
@@ -240,14 +225,12 @@ async def handle_zip_upload(file: UploadFile, repo_id: str) -> None:
             kind="zip",
         )
 
-        # ----- kick off indexing -----
         index_repo(dest, repo_id)
 
     except Exception as e:
         logger.exception("ZIP upload failed: %s", e)
         _emit_phase(repo_id, "upload", status="error", message=f"ZIP upload failed: {e}")
     finally:
-        # cleanup of artifacts
         for p in (tmp_path,):
             try:
                 if os.path.exists(p) and os.path.getsize(p) == 0:
